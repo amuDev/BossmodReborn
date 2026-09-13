@@ -32,7 +32,7 @@ public struct BeastmasterGauge
     [FieldOffset(14)] public byte Unk14;
 }
 
-sealed class MainDebugWindow(WorldState ws, RotationModuleManager autorot, ZoneModuleManager zmm, ActionManagerEx amex, MovementOverride move, AIHintsBuilder hintBuilder, IDalamudPluginInterface dalamud, RotationSolverRebornModule rsr) : UIWindow("Boss mod debug UI", false, new(300, 200))
+sealed class MainDebugWindow(WorldState ws, BossModuleManager bmm, RotationModuleManager autorot, ZoneModuleManager zmm, ActionManagerEx amex, MovementOverride move, AIHintsBuilder hintBuilder, IDalamudPluginInterface dalamud, RotationSolverRebornModule rsr) : UIWindow("Boss mod debug UI", false, new(300, 200))
 {
     private readonly DebugObstacles _debugObstacles = new(hintBuilder.Obstacles, dalamud);
     private readonly DebugObjects _debugObjects = new();
@@ -48,6 +48,7 @@ sealed class MainDebugWindow(WorldState ws, RotationModuleManager autorot, ZoneM
     private readonly DebugTeleport _debugTeleport = new();
     private readonly DebugCollision _debugCollision = new();
     private readonly DebugQuests _debugQuests = new();
+    private ZoneArenaEditorWindow? _zoneArenaEditor;
 
     protected override void Dispose(bool disposing)
     {
@@ -57,6 +58,7 @@ sealed class MainDebugWindow(WorldState ws, RotationModuleManager autorot, ZoneM
         _debugMapEffect.Dispose();
         _debugTeleport.Dispose();
         _debugCollision.Dispose();
+        _zoneArenaEditor?.Dispose();
         base.Dispose(disposing);
     }
 
@@ -76,6 +78,12 @@ sealed class MainDebugWindow(WorldState ws, RotationModuleManager autorot, ZoneM
             ImGui.TextUnformatted($"Director address: 0x{(nint)instanceDirector:X}");
         }
 
+        if (ImGui.Button("Zone arena editor (offline)"))
+        {
+            _zoneArenaEditor ??= new(bmm, dalamud);
+            _zoneArenaEditor.OpenAndBringToFront();
+        }
+        ImGui.SameLine();
         if (ImGui.Button("Perform full dump"))
         {
             DebugObjects.DumpObjectTable();
