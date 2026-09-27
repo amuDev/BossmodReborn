@@ -27,16 +27,11 @@ public sealed class ArenaPolygonPipeline
         public List<PreviewContour> Holes = [];
     }
 
-    public const long ClipperScale = 1024L * 1024L;
+    public const long ClipperScale = TrianglePolygonBuilder.ClipperScale;
 
     // inputs
-    public List<CollisionOutlinesExtractor.PolygonWithHoles> Raw = [];
-    public readonly List<Path64> CutPaths = [];
-    public readonly List<Path64> UnionPaths = [];
-    public readonly List<Vector3> BoxYSource = [];
-    public int CutBoxCount, UnionBoxCount;
-    public bool KeepContainingAnchor = true;
-    public Vector2 AnchorXZ;
+    public List<PolygonWithHoles> Raw = [];
+    public Vector2 AnchorXZ; // the arena centre: the piece an opening cuts loose that contains it is the one to keep
     public string KeepStatus = "";
     // simplify knobs
     public float Epsilon = 0.02f;
@@ -50,6 +45,15 @@ public sealed class ArenaPolygonPipeline
     // codegen knobs
     public string ArenaFieldName = "arena";
     public bool AdjustForHitboxInwards = true; // emit AdjustForHitboxInwards: true so the framework shrinks the bounds by the hitbox radius
+    public bool AdjustForHitboxOutwards; // emit AdjustForHitboxOutwards: true (grow by the hitbox radius instead)
+    public bool AutoLayered = true; // the module snippet takes the layered form by itself when the enabled contours sit at more than one floor height
+    // the ArenaBoundsCustom the snippet would produce, built on demand for the world/canvas preview so the framework's own post-processing
+    // (hitbox offsets, polygon simplification) can be looked at before pasting
+    private ArenaBoundsCustom? _previewBounds;
+    private (int version, bool inwards, bool outwards, bool projection, ulong enabled) _previewBoundsKey;
+    private (int version, ulong enabled, float gap, int count) _floorHeightsKey = (-1, 0UL, 0f, 0);
+    private int _previewVersion;
+    public string PreviewBoundsStatus = "";
     public float FlatThreshold = 0.5f;
     public bool EmitProjectionHeightZero;
     public float LayerGap = 1f;
@@ -74,22 +78,10 @@ public sealed class ArenaPolygonPipeline
         Raw = [];
         Preview.Clear();
         DeletedVertices.Clear();
-        CutPaths.Clear();
-        UnionPaths.Clear();
-        BoxYSource.Clear();
-        CutBoxCount = UnionBoxCount = 0;
         KeepStatus = "";
         HoverContour = null;
         Status = "";
         SnippetDirty = true;
-    }
-
-    // applies the box footprints (cut/union) to raw polygons and keeps the polygon containing the anchor when configured
-    public List<CollisionOutlinesExtractor.PolygonWithHoles> ApplyBoxOps(List<CollisionOutlinesExtractor.PolygonWithHoles> polys, float minArea)
-    {
-        var result = BoxFootprintOps.Apply(polys, CutPaths, UnionPaths, BoxYSource, KeepContainingAnchor ? AnchorXZ : null, minArea, out var keepStatus, ClipperScale);
-        KeepStatus = keepStatus;
-        return result;
     }
 
     public void RebuildSimplified() => RebuildSimplified(CurrentSimplify);
@@ -126,11 +118,12 @@ public sealed class ArenaPolygonPipeline
             }
 
             // source vertices used to recover Y for simplified/offset points
-            List<Vector3> ySource = [.. raw.Outer];
+            List<Vector3> yPoints = [.. raw.Outer];
             for (var h = 0; h < holeCount; ++h)
             {
-                ySource.AddRange(raw.Holes[h]);
+                yPoints.AddRange(raw.Holes[h]);
             }
+            var ySource = new YSampler(yPoints);
 
             var paths = new Paths64(1 + holeCount) { BoxFootprintOps.ToPath64(raw.Outer, false, ClipperScale) };
             for (var h = 0; h < holeCount; ++h)
@@ -144,7 +137,7 @@ public sealed class ArenaPolygonPipeline
                 // miter joins keep corners sharp, so closing/opening only change the parts thinner than the diameter
                 if (s.Closing > 0f)
                 {
-                    shaped = Clipper.InflatePaths(Clipper.InflatePaths(shaped, s.Closing * ClipperScale, JoinType.Miter, EndType.Polygon), -s.Closing * ClipperScale, JoinType.Miter, EndType.Polygon);
+                    shaped = BoxFootprintOps.ClosePaths(shaped, s.Closing, ClipperScale);
                 }
                 if (s.Opening > 0f)
                 {
@@ -157,16 +150,33 @@ public sealed class ArenaPolygonPipeline
                 var tree = new PolyTree64();
                 Clipper.BooleanOp(ClipType.Union, shaped, null, tree, FillRule.NonZero);
                 var before = Preview.Count;
-                AddTreeOuters(tree, ySource, raw.Outer, s);
+                var collector = new PreviewCollector(this, ySource, raw, s);
+                BoxFootprintOps.WalkTree(tree, ref collector);
                 if (s.Opening > 0f && Preview.Count - before > 1)
                 {
-                    // the opening cut pieces off that were only joined through a passage narrower than the hitbox: unreachable, keep the largest
-                    var best = before;
-                    for (var k = before + 1; k < Preview.Count; ++k)
+                    // the opening cut pieces off that were only joined through a passage narrower than the hitbox: unreachable, keep the
+                    // piece around the arena centre when it is known, else the largest
+                    var best = -1;
+                    if (AnchorXZ != default)
                     {
-                        if (Preview[k].Outer.Area > Preview[best].Outer.Area)
+                        var anchor = TrianglePolygonBuilder.ToP64(AnchorXZ, ClipperScale);
+                        for (var k = before; k < Preview.Count && best < 0; ++k)
                         {
-                            best = k;
+                            if (BoxFootprintOps.Contains(ToPath64(Preview[k].Outer.Simplified), anchor))
+                            {
+                                best = k;
+                            }
+                        }
+                    }
+                    if (best < 0)
+                    {
+                        best = before;
+                        for (var k = before + 1; k < Preview.Count; ++k)
+                        {
+                            if (Preview[k].Outer.Area > Preview[best].Outer.Area)
+                            {
+                                best = k;
+                            }
                         }
                     }
                     for (var k = Preview.Count - 1; k >= before; --k)
@@ -218,20 +228,83 @@ public sealed class ArenaPolygonPipeline
         }
         SimplifyMs = sw.ElapsedMilliseconds;
         SnippetDirty = true;
+        ++_previewVersion;
     }
 
-    private void RemoveDeletedVertices(List<WPos> pts)
+    public void InvalidatePreviewBounds()
+    {
+        _previewBounds = null;
+        ++_previewVersion;
+    }
+
+    private static Path64 ToPath64(WPos[] pts)
+    {
+        var path = new Path64(pts.Length);
+        for (var i = 0; i < pts.Length; ++i)
+        {
+            path.Add(TrianglePolygonBuilder.ToP64(new Vector2(pts[i].X, pts[i].Z), ClipperScale));
+        }
+        return path;
+    }
+
+    // FNV-1a over the enable flags of every contour, in table order (the editor writes the flags directly, so no counter can track them)
+    private ulong EnabledHash()
+    {
+        var h = 14695981039346656037UL;
+        for (var i = 0; i < Preview.Count; ++i)
+        {
+            h = (h ^ (Preview[i].Outer.Enabled ? 1UL : 2UL)) * 1099511628211UL;
+            var holes = Preview[i].Holes;
+            for (var j = 0; j < holes.Count; ++j)
+            {
+                h = (h ^ (holes[j].Enabled ? 1UL : 2UL)) * 1099511628211UL;
+            }
+        }
+        return h;
+    }
+
+    // cached bounds for the preview; rebuilt when the simplified contours, the enabled flags or the codegen options changed
+    public ArenaBoundsCustom? PreviewBounds()
+    {
+        var key = (_previewVersion, AdjustForHitboxInwards, AdjustForHitboxOutwards, EmitProjectionHeightZero, EnabledHash());
+        if (_previewBounds == null || key != _previewBoundsKey)
+        {
+            _previewBoundsKey = key;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _previewBounds = BuildArenaBounds();
+            if (_previewBounds != null)
+            {
+                var parts = _previewBounds.Shape.Parts;
+                var verts = 0;
+                for (var i = 0; i < parts.Count; ++i)
+                {
+                    verts += parts[i].Vertices.Count;
+                }
+                PreviewBoundsStatus = $"bounds: {parts.Count} part(s), {verts} verts, centre ({_previewBounds.Center.X:f2}, {_previewBounds.Center.Z:f2}), r {_previewBounds.Radius:f1}, built in {sw.ElapsedMilliseconds} ms{(AdjustForHitboxInwards ? ", hitbox inwards" : "")}{(AdjustForHitboxOutwards ? ", hitbox outwards" : "")}";
+            }
+            else
+            {
+                PreviewBoundsStatus = "bounds: no enabled polygons";
+            }
+        }
+        return _previewBounds;
+    }
+
+    // deleted vertices match within half a unit of the last decimal on each axis, so they survive a change of the rounding
+    private void RemoveDeletedVertices(List<WPos> pts, int decimals)
     {
         var deleted = DeletedVertices;
         if (deleted.Count == 0)
         {
             return;
         }
+        var half = 0.5f * MathF.Pow(10f, -decimals);
+        var tol2 = 2f * half * half + 1e-9f;
         for (var i = pts.Count - 1; i >= 0 && pts.Count > 3; --i)
         {
             for (var d = 0; d < deleted.Count; ++d)
             {
-                if ((pts[i] - deleted[d]).LengthSq() < 0.0005f * 0.0005f + 1e-6f)
+                if ((pts[i] - deleted[d]).LengthSq() < tol2)
                 {
                     pts.RemoveAt(i);
                     break;
@@ -270,41 +343,92 @@ public sealed class ArenaPolygonPipeline
         }
     }
 
-    private void AddTreeOuters(PolyPath64 node, List<Vector3> ySource, List<Vector3> rawContour, in SimplifySettings s)
+    // the shaped tree as preview polygons; every outer carries the raw outer's vertices, a hole its raw hole's: by index when the shaping kept
+    // the hole count, else the raw hole with the nearest centroid, none when the raw polygon had no holes
+    private struct PreviewCollector : ITreeVisitor
     {
-        var count = node.Count;
-        for (var i = 0; i < count; ++i)
+        private readonly ArenaPolygonPipeline _owner;
+        private readonly YSampler _ySource;
+        private readonly PolygonWithHoles _raw;
+        private readonly SimplifySettings _s;
+        private readonly Vector2[] _rawHoleCentroids;
+        private PreviewPolygon? _poly;
+        private bool _byIndex;
+
+        public PreviewCollector(ArenaPolygonPipeline owner, YSampler ySource, PolygonWithHoles raw, in SimplifySettings s)
         {
-            var outerNode = node[i];
-            if (outerNode.Polygon == null)
+            _owner = owner;
+            _ySource = ySource;
+            _raw = raw;
+            _s = s;
+            _rawHoleCentroids = new Vector2[raw.Holes.Count];
+            for (var h = 0; h < raw.Holes.Count; ++h)
             {
-                continue;
-            }
-            var poly = new PreviewPolygon();
-            if (FinishContour(poly.Outer, outerNode.Polygon, ySource, rawContour, s))
-            {
-                var holeCount = outerNode.Count;
-                for (var h = 0; h < holeCount; ++h)
+                var c = Vector2.Zero;
+                var pts = raw.Holes[h];
+                for (var i = 0; i < pts.Count; ++i)
                 {
-                    var holeNode = outerNode[h];
-                    if (holeNode.Polygon == null)
-                    {
-                        continue;
-                    }
-                    var hole = new PreviewContour();
-                    if (FinishContour(hole, holeNode.Polygon, ySource, rawContour, s))
-                    {
-                        poly.Holes.Add(hole);
-                    }
-                    AddTreeOuters(holeNode, ySource, rawContour, s); // islands inside holes become separate outers
+                    c += new Vector2(pts[i].X, pts[i].Z);
                 }
-                Preview.Add(poly);
+                _rawHoleCentroids[h] = pts.Count > 0 ? c / pts.Count : c;
             }
+        }
+
+        public bool Outer(Path64 path, int holeCount)
+        {
+            _poly = new();
+            _byIndex = holeCount == _raw.Holes.Count;
+            return _owner.FinishContour(_poly.Outer, path, _ySource, _raw.Outer, _s);
+        }
+
+        public void Hole(Path64 path, int index)
+        {
+            var hole = new PreviewContour();
+            if (_owner.FinishContour(hole, path, _ySource, RawHole(path, index), _s))
+            {
+                _poly!.Holes.Add(hole);
+            }
+        }
+
+        public void EndOuter()
+        {
+            _owner.Preview.Add(_poly!);
+            _poly = null;
+        }
+
+        private readonly List<Vector3> RawHole(Path64 path, int index)
+        {
+            if (_rawHoleCentroids.Length == 0)
+            {
+                return [];
+            }
+            if (_byIndex)
+            {
+                return _raw.Holes[index];
+            }
+            var c = Vector2.Zero;
+            for (var i = 0; i < path.Count; ++i)
+            {
+                c += new Vector2((float)(path[i].X / (double)ClipperScale), (float)(path[i].Y / (double)ClipperScale));
+            }
+            c /= path.Count;
+            var best = 0;
+            var bestD = float.MaxValue;
+            for (var h = 0; h < _rawHoleCentroids.Length; ++h)
+            {
+                var d = (_rawHoleCentroids[h] - c).LengthSquared();
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = h;
+                }
+            }
+            return _raw.Holes[best];
         }
     }
 
     // simplify, round and convert one clipper contour; returns false when it degenerates
-    private bool FinishContour(PreviewContour dst, Path64 path, List<Vector3> ySource, List<Vector3> rawContour, in SimplifySettings s)
+    private bool FinishContour(PreviewContour dst, Path64 path, YSampler ySource, List<Vector3> rawContour, in SimplifySettings s)
     {
         if (s.Epsilon > 0f)
         {
@@ -335,7 +459,7 @@ public sealed class ArenaPolygonPipeline
         {
             pts.RemoveAt(pts.Count - 1);
         }
-        RemoveDeletedVertices(pts);
+        RemoveDeletedVertices(pts, s.Decimals);
         RemoveSpikes(pts, s.TrimCollinear);
         if (pts.Count < 3)
         {
@@ -390,7 +514,7 @@ public sealed class ArenaPolygonPipeline
         dst.SimplifiedDraw = new Vector3[count];
         for (var i = 0; i < count; ++i)
         {
-            dst.SimplifiedDraw[i] = new(pts[i].X, BoxFootprintOps.NearestY(ySource, pts[i].X, pts[i].Z), pts[i].Z);
+            dst.SimplifiedDraw[i] = new(pts[i].X, ySource.Sample(pts[i].X, pts[i].Z), pts[i].Z);
         }
         dst.Area = area;
         dst.MinY = rawN > 0 ? minY : 0f;
@@ -403,25 +527,39 @@ public sealed class ArenaPolygonPipeline
         return true;
     }
 
+    // the polygons whose outer is enabled, and the enabled holes of one of them
+    private IEnumerable<PreviewPolygon> EnabledPolygons()
+    {
+        for (var i = 0; i < Preview.Count; ++i)
+        {
+            if (Preview[i].Outer.Enabled)
+            {
+                yield return Preview[i];
+            }
+        }
+    }
+
+    private static IEnumerable<PreviewContour> EnabledHoles(PreviewPolygon poly)
+    {
+        for (var h = 0; h < poly.Holes.Count; ++h)
+        {
+            if (poly.Holes[h].Enabled)
+            {
+                yield return poly.Holes[h];
+            }
+        }
+    }
+
     public int EnabledContourCounts(out int holes)
     {
         var outers = 0;
         holes = 0;
-        var count = Preview.Count;
-        for (var i = 0; i < count; ++i)
+        foreach (var poly in EnabledPolygons())
         {
-            var poly = Preview[i];
-            if (!poly.Outer.Enabled)
-            {
-                continue;
-            }
             ++outers;
-            for (var h = 0; h < poly.Holes.Count; ++h)
+            foreach (var _ in EnabledHoles(poly))
             {
-                if (poly.Holes[h].Enabled)
-                {
-                    ++holes;
-                }
+                ++holes;
             }
         }
         return outers;
@@ -432,22 +570,13 @@ public sealed class ArenaPolygonPipeline
         outers.Clear();
         holes.Clear();
         outerContours.Clear();
-        var count = Preview.Count;
-        for (var i = 0; i < count; ++i)
+        foreach (var poly in EnabledPolygons())
         {
-            var poly = Preview[i];
-            if (!poly.Outer.Enabled)
-            {
-                continue;
-            }
             outers.Add(poly.Outer.Simplified);
             outerContours.Add(poly.Outer);
-            for (var h = 0; h < poly.Holes.Count; ++h)
+            foreach (var hole in EnabledHoles(poly))
             {
-                if (poly.Holes[h].Enabled)
-                {
-                    holes.Add(poly.Holes[h].Simplified);
-                }
+                holes.Add(hole.Simplified);
             }
         }
     }
@@ -493,7 +622,7 @@ public sealed class ArenaPolygonPipeline
         }
         try
         {
-            var bounds = new ArenaBoundsCustom(union, difference);
+            var bounds = new ArenaBoundsCustom(union, difference, AdjustForHitboxInwards: AdjustForHitboxInwards, AdjustForHitboxOutwards: AdjustForHitboxOutwards);
             if (flat)
             {
                 var floor = MathF.Round(meanY, 1);
@@ -521,9 +650,56 @@ public sealed class ArenaPolygonPipeline
         return BuildArenaBounds(_genOuters, _genHoles, flat, meanY);
     }
 
+    // the enabled contours as plain vertex lists (saved with a project so rules of another project can emit this arena)
+    public List<SavedPolygon> ExportEnabledPolygons(out bool flat, out float meanY)
+    {
+        List<SavedPolygon> result = [];
+        foreach (var poly in EnabledPolygons())
+        {
+            var sp = new SavedPolygon { Outer = Flatten(poly.Outer.Simplified), MeanY = poly.Outer.MeanY, MinY = poly.Outer.MinY, MaxY = poly.Outer.MaxY };
+            foreach (var hole in EnabledHoles(poly))
+            {
+                sp.Holes.Add(Flatten(hole.Simplified));
+            }
+            result.Add(sp);
+        }
+        CollectEnabled(_genOuters, _genHoles, _genOuterContours);
+        (flat, meanY, _, _) = YStats(_genOuterContours);
+        return result;
+
+        static float[] Flatten(WPos[] pts)
+        {
+            var r = new float[pts.Length * 2];
+            for (var i = 0; i < pts.Length; ++i)
+            {
+                r[2 * i] = pts[i].X;
+                r[2 * i + 1] = pts[i].Z;
+            }
+            return r;
+        }
+    }
+
+    // the number of floor heights among the enabled contours, cached per preview version / enable flags / layer gap (read every frame)
+    public int FloorHeightCount
+    {
+        get
+        {
+            var enabled = EnabledHash();
+            if (_floorHeightsKey.version != _previewVersion || _floorHeightsKey.enabled != enabled || _floorHeightsKey.gap != LayerGap)
+            {
+                _floorHeightsKey = (_previewVersion, enabled, LayerGap, CountYClusters(out _));
+            }
+            return _floorHeightsKey.count;
+        }
+    }
+
     public string BuildModuleSnippet(string provenanceHeader, bool midFightSwap)
     {
         CollectEnabled(_genOuters, _genHoles, _genOuterContours);
+        if (!midFightSwap && AutoLayered && ClusterCollected(out var clusters) >= 2)
+        {
+            return LayeredSnippetCollected(provenanceHeader, clusters);
+        }
         if (_genOuters.Count == 0)
         {
             return "// no enabled polygons";
@@ -534,7 +710,7 @@ public sealed class ArenaPolygonPipeline
         var sb = new StringBuilder();
         sb.Append(provenanceHeader);
         CollisionArenaCodeGen.AppendVertexFields(sb, _genOuters, _genHoles, LastSimplify.Decimals);
-        sb.Append(CollisionArenaCodeGen.ArenaDeclaration(name, _genOuters.Count, _genHoles.Count, flat, meanY, minY, maxY, EmitProjectionHeightZero, AdjustForHitboxInwards));
+        sb.Append(CollisionArenaCodeGen.ArenaDeclaration(name, _genOuters.Count, _genHoles.Count, flat, meanY, minY, maxY, EmitProjectionHeightZero, AdjustForHitboxInwards, AdjustForHitboxOutwards));
         if (midFightSwap)
         {
             sb.AppendLine($"Arena.Bounds = {name};");
@@ -555,6 +731,12 @@ public sealed class ArenaPolygonPipeline
     private int CountYClusters(out List<List<int>> clusters)
     {
         CollectEnabled(_genOuters, _genHoles, _genOuterContours);
+        return ClusterCollected(out clusters);
+    }
+
+    // the collected outer contours grouped by mean height (gaps above LayerGap start a new layer), lowest first
+    private int ClusterCollected(out List<List<int>> clusters)
+    {
         clusters = [];
         var n = _genOuterContours.Count;
         var order = new int[n];
@@ -580,11 +762,17 @@ public sealed class ArenaPolygonPipeline
 
     public string BuildLayeredSnippet(string provenanceHeader)
     {
-        var clusterCount = CountYClusters(out var clusters);
-        if (clusterCount < 2)
+        if (CountYClusters(out var clusters) < 2)
         {
             return "// fewer than two floor heights - use the module snippet";
         }
+        return LayeredSnippetCollected(provenanceHeader, clusters);
+    }
+
+    // the layered snippet over the collected contours and their clusters
+    private string LayeredSnippetCollected(string provenanceHeader, List<List<int>> clusters)
+    {
+        var clusterCount = clusters.Count;
         var bounds = BuildArenaBounds(_genOuters, _genHoles, false, 0f);
         var sb = new StringBuilder();
         sb.Append(provenanceHeader);
@@ -662,22 +850,13 @@ public sealed class ArenaPolygonPipeline
 
     public string BuildRawSnippet(CollisionOutlinesExtractor.ClipboardVectorFormat fmt)
     {
-        List<CollisionOutlinesExtractor.PolygonWithHoles> polys = [];
-        var count = Preview.Count;
-        for (var i = 0; i < count; ++i)
+        List<PolygonWithHoles> polys = [];
+        foreach (var poly in EnabledPolygons())
         {
-            var poly = Preview[i];
-            if (!poly.Outer.Enabled)
+            var p = new PolygonWithHoles { Outer = [.. poly.Outer.SimplifiedDraw], Holes = [] };
+            foreach (var hole in EnabledHoles(poly))
             {
-                continue;
-            }
-            var p = new CollisionOutlinesExtractor.PolygonWithHoles { Outer = [.. poly.Outer.SimplifiedDraw], Holes = [] };
-            for (var h = 0; h < poly.Holes.Count; ++h)
-            {
-                if (poly.Holes[h].Enabled)
-                {
-                    p.Holes.Add([.. poly.Holes[h].SimplifiedDraw]);
-                }
+                p.Holes.Add([.. hole.SimplifiedDraw]);
             }
             polys.Add(p);
         }
@@ -757,10 +936,31 @@ public sealed class ArenaPolygonPipeline
             ImGui.SetTooltip("Add WorldProjectionHeight = 0f to the bounds (flat 3D arena projection instead of the default wall height)");
         }
         ImGui.SameLine();
-        SnippetDirty |= ImGui.Checkbox("AdjustForHitboxInwards", ref AdjustForHitboxInwards);
+        // the two hitbox offsets are exclusive: switching one on switches the other off
+        if (ImGui.Checkbox("AdjustForHitboxInwards", ref AdjustForHitboxInwards))
+        {
+            SnippetDirty = true;
+            if (AdjustForHitboxInwards)
+            {
+                AdjustForHitboxOutwards = false;
+            }
+        }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Emit AdjustForHitboxInwards: true - the framework offsets the bounds inwards by the player hitbox radius (0.5y), the equivalent of walking the edge with the hitbox circle; keep Offset at 0 when this is on");
+            ImGui.SetTooltip("Emit AdjustForHitboxInwards: true - the framework offsets the bounds inwards by the player hitbox radius (0.5y), the equivalent of walking the edge with the hitbox circle; keep Offset at 0 when this is on. Exclusive with Outwards");
+        }
+        ImGui.SameLine();
+        if (ImGui.Checkbox("Outwards", ref AdjustForHitboxOutwards))
+        {
+            SnippetDirty = true;
+            if (AdjustForHitboxOutwards)
+            {
+                AdjustForHitboxInwards = false;
+            }
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Emit AdjustForHitboxOutwards: true - the framework grows the bounds by the player hitbox radius instead. Exclusive with Inwards. The 'ArenaBoundsCustom' preview shows the result of either flag");
         }
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80f);
@@ -774,6 +974,17 @@ public sealed class ArenaPolygonPipeline
     public void DrawCodegenButtons(Func<string> provenanceHeader)
     {
         var outers = EnabledContourCounts(out _);
+        if (outers > 0)
+        {
+            var heights = FloorHeightCount;
+            ImGui.Checkbox("auto layered", ref AutoLayered);
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip("When the enabled contours sit at more than one floor height (see 'Layer Y gap'), the module snippet is the layered form (one ArenaProjectionLayer per height) without asking");
+            }
+            ImGui.SameLine();
+            ImGui.TextDisabled(heights >= 2 ? $"{heights} floor heights: the module snippet is {(AutoLayered ? "the layered form" : "flat (auto layered off)")}" : "one floor height");
+        }
         using var disabled = ImRaii.Disabled(outers == 0);
         if (ImGui.Button("Copy module snippet"))
         {
@@ -955,7 +1166,7 @@ public sealed class ArenaPolygonPipeline
             SnippetDirty = true;
         }
         ImGui.TableNextColumn();
-        ImGui.Selectable(index.ToString(), false, ImGuiSelectableFlags.SpanAllColumns);
+        ImGui.Selectable(index.ToString(), false, ImGuiSelectableFlags.SpanAllColumns | ImGuiSelectableFlags.AllowItemOverlap);
         if (ImGui.IsItemHovered())
         {
             HoverContour = c;
@@ -988,9 +1199,13 @@ public sealed class ArenaPolygonPipeline
 }
 
 // pure text builders for the arena snippets (repo conventions: collection expressions, f suffixes, 5 vertices per line)
-internal static class CollisionArenaCodeGen
+public static class CollisionArenaCodeGen
 {
-    public static string F(float v, int decimals) => v.ToString("F" + decimals, CultureInfo.InvariantCulture) + "f";
+    public static string F(float v, int decimals)
+    {
+        var s = v.ToString("F" + decimals, CultureInfo.InvariantCulture);
+        return (s[0] == '-' && !s.AsSpan(1).ContainsAnyExcept("0.") ? s[1..] : s) + "f"; // a value rounding to zero is written without the sign
+    }
 
     public static void AppendVertexField(StringBuilder sb, string name, WPos[] pts, int decimals, string trailingComment)
     {
@@ -1007,27 +1222,32 @@ internal static class CollisionArenaCodeGen
         sb.Append("];").Append(trailingComment).Append("\r\n");
     }
 
-    public static void AppendVertexFields(StringBuilder sb, List<WPos[]> outers, List<WPos[]> holes, int decimals)
+    // vertexPrefix distinguishes several arenas in one snippet ("room" -> roomVertices / roomHole0)
+    public static void AppendVertexFields(StringBuilder sb, List<WPos[]> outers, List<WPos[]> holes, int decimals, string vertexPrefix = "")
     {
         var single = outers.Count == 1 && holes.Count == 0;
         for (var i = 0; i < outers.Count; ++i)
         {
-            AppendVertexField(sb, single ? "vertices" : $"vertices{i}", outers[i], decimals, "");
+            AppendVertexField(sb, single ? $"{vertexPrefix}{Cap(vertexPrefix, "vertices")}" : $"{vertexPrefix}{Cap(vertexPrefix, "vertices")}{i}", outers[i], decimals, "");
         }
         for (var i = 0; i < holes.Count; ++i)
         {
-            AppendVertexField(sb, $"hole{i}", holes[i], decimals, "");
+            AppendVertexField(sb, $"{vertexPrefix}{Cap(vertexPrefix, "hole")}{i}", holes[i], decimals, "");
         }
     }
 
-    public static string ArenaDeclaration(string name, int outerCount, int holeCount, bool flat, float meanY, float minY, float maxY, bool emitProjectionHeightZero, bool adjustForHitboxInwards = false)
+    private static string Cap(string prefix, string word) => prefix.Length > 0 ? char.ToUpperInvariant(word[0]) + word[1..] : word;
+
+    public static string ArenaDeclaration(string name, int outerCount, int holeCount, bool flat, float meanY, float minY, float maxY, bool emitProjectionHeightZero, bool adjustForHitboxInwards = false, bool adjustForHitboxOutwards = false, string vertexPrefix = "")
     {
         var single = outerCount == 1 && holeCount == 0;
+        var vertices = $"{vertexPrefix}{Cap(vertexPrefix, "vertices")}";
+        var hole = $"{vertexPrefix}{Cap(vertexPrefix, "hole")}";
         var sb = new StringBuilder();
         sb.Append($"private static readonly ArenaBoundsCustom {name} = new([");
         for (var i = 0; i < outerCount; ++i)
         {
-            sb.Append(i > 0 ? ", " : "").Append($"new PolygonCustom({(single ? "vertices" : $"vertices{i}")})");
+            sb.Append(i > 0 ? ", " : "").Append($"new PolygonCustom({(single ? vertices : $"{vertices}{i}")})");
         }
         sb.Append(']');
         if (holeCount > 0)
@@ -1035,13 +1255,17 @@ internal static class CollisionArenaCodeGen
             sb.Append(", [");
             for (var i = 0; i < holeCount; ++i)
             {
-                sb.Append(i > 0 ? ", " : "").Append($"new PolygonCustom(hole{i})");
+                sb.Append(i > 0 ? ", " : "").Append($"new PolygonCustom({hole}{i})");
             }
             sb.Append(']');
         }
         if (adjustForHitboxInwards)
         {
             sb.Append(", AdjustForHitboxInwards: true");
+        }
+        if (adjustForHitboxOutwards)
+        {
+            sb.Append(", AdjustForHitboxOutwards: true");
         }
         sb.Append(')');
         if (flat)

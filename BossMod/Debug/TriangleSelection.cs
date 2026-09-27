@@ -141,8 +141,11 @@ public sealed class TriangleSelection(HashSet<int> selected)
         _strokeRemoved = null;
     }
 
+    // undo/redo during a brush drag first commit the stroke so far as its own entry (the rest of the drag records single edits), so a
+    // stroke can never push edits that were already undone under it
     public void Undo()
     {
+        EndStroke();
         if (_undo.Count == 0)
         {
             return;
@@ -163,6 +166,7 @@ public sealed class TriangleSelection(HashSet<int> selected)
 
     public void Redo()
     {
+        EndStroke();
         if (_redo.Count == 0)
         {
             return;

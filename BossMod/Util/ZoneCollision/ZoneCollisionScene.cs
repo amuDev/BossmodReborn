@@ -1,3 +1,5 @@
+using Clipper2Lib;
+
 namespace BossMod;
 
 // offline collision scene of a territory: layout instances placed in world space, with a flat triangle store for editing/auto-mapping
@@ -7,13 +9,42 @@ public sealed class ZoneLayer
     public int Index;
     public string SourceFile = "";
     public uint GroupId;
+    public uint LayerId;  // full 32-bit layer id; Key is the low word the layout object id uses
     public ushort Key;
     public string Name = "";
     public ushort FestivalId, FestivalPhase;
+    public bool IsTemporary;
     public int InstanceCount;
     public bool Enabled;
     public string SharedGroupChain = ""; // "" for top-level layers, else the chain of shared-group instance names that own this layer
+    public int ParentNode = -1;          // the shared-group node that instantiated this layer, -1 for top-level layers
+    public ulong PathId;                 // stable across loads: hash of the owning node chain, source file and layer id
     public bool IsTerrain;
+
+    public string StablePath => $"{SourceFile}/{LayerId}/{Name}<{SharedGroupChain}>";
+}
+
+// one instantiated layout instance (every type, including shared-group instances and trigger ranges), placed in world space; nodes are
+// appended depth-first so a node's descendants are [Index + 1, SubtreeEnd)
+public sealed class ZoneNode
+{
+    public int Index;
+    public int Parent = -1;
+    public int SubtreeEnd;
+    public int LayerIndex;
+    public int Depth;
+    public int Type;
+    public uint InstanceKey;
+    public string Name = "";
+    public Matrix4x4 World = Matrix4x4.Identity;
+    public ulong LayoutObjectId; // the game's id form (not unique across shared-group instantiations); matches the live collision scene's object ids
+    public ulong PathId;         // unique and stable: hash of the ancestor chain + layer id + instance key
+    public ZoneCollisionScene Scene = null!;
+    public LgbInstance Source = null!;
+    public int MeshIndex = -1, BoxIndex = -1, AnalyticIndex = -1, MarkerIndex = -1;
+
+    public Vector3 Position => World.Translation;
+    public string Path => Scene.NodePath(Index); // e.g. "planmap.lgb/LVD_gimmick_01/4554EE>sgpl_w_lvd_b0118_wide.sgb/0/9", built on demand
 }
 
 public sealed class ZoneMeshInstance
@@ -23,15 +54,13 @@ public sealed class ZoneMeshInstance
     public string Name = "";
     public ulong LayoutObjectId;
     public int LayerIndex;
-    public int SourceInstanceType;
+    public int NodeIndex = -1;
     public uint InstanceKey;
     public ushort LayerKey;
     public Matrix4x4 World = Matrix4x4.Identity;
-    public Matrix4x4 ParentWorld = Matrix4x4.Identity; // shared-group parent chain, identity for top-level instances
-    public Vector3 Translation, RotationEuler, Scale = Vector3.One; // file-space values, kept for the validator
+    public Vector3 Translation, RotationEuler, Scale = Vector3.One; // the instance's own transform components as the layout stores them (World includes the parents)
     public ulong ObjMatValue, ObjMatMask;
     public bool IsTerrainTile;
-    public uint TerrainMeshId;
     public Bounds3 WorldBounds;
     public PcbMesh Mesh = null!;
     public int TriStart = -1, TriCount;
@@ -44,6 +73,7 @@ public sealed class ZoneBoxInstance
     public string Name = "";
     public ulong LayoutObjectId;
     public int LayerIndex;
+    public int NodeIndex = -1;
     public uint InstanceKey;
     public ushort LayerKey;
     public Matrix4x4 World = Matrix4x4.Identity;
@@ -52,10 +82,14 @@ public sealed class ZoneBoxInstance
     public ulong MatValue, MatMask;
     public LgbColliderKind Kind;
     public bool ActiveByDefault = true;
-    public Vector3[] Corners = new Vector3[8]; // world corners of the local box, same order as the live tab's _boxCorners
+    public Vector3[] Corners = new Vector3[8]; // world corners of the local box, in UnitCorners order
     public Bounds3 WorldBounds;
     public Bounds3 LocalBounds = new(new(-1f), new(1f)); // unit cube for collision boxes; analytic bg-part boxes carry their own bounds
     public bool IsAnalytic;
+    private Path64? _footprint;
+
+    // XZ convex hull of the world corners (counter-clockwise, default clipper scale), computed once; inflate with BoxFootprintOps.Inflate
+    public Path64 FootprintXZ => _footprint ??= BoxFootprintOps.BoxFootprint(Corners, 0f);
 
     // (-1,-1,-1) (-1,-1,1) (-1,1,-1) (-1,1,1) (1,-1,-1) (1,-1,1) (1,1,-1) (1,1,1)
     public static readonly Vector3[] UnitCorners =
@@ -65,7 +99,7 @@ public sealed class ZoneBoxInstance
     ];
 }
 
-// layout instances that are not colliders but help locate arenas: exit ranges (dungeon exits), pop ranges (spawn points), event objects
+// layout instances that are not colliders but carry the scripting: exit/pop ranges, event objects, trigger volumes, npc/treasure placements
 public sealed class ZoneMarker
 {
     public int Index;
@@ -73,13 +107,30 @@ public sealed class ZoneMarker
     public string Name = "";
     public ulong LayoutObjectId;
     public int LayerIndex;
+    public int NodeIndex = -1;
+    public uint InstanceKey;
     public Vector3 Position;
+    public uint BaseId;           // EventObject: EObj row id (the OID of the EventObj actor in game / in replays); PopRange: pop type; npc/treasure: base row
+    public uint BoundInstanceId;  // EventObject: the layout instance it controls
+    public uint LinkedInstanceId;
+    public bool ActiveByDefault = true;
+    public LgbInstance Source = null!;  // typed payload (Pop, Exit, Map, Trigger, Npc, Treasure)
+    public Vector3[]? Corners;          // trigger volumes: world corners of the unit box
+    public Bounds3 WorldBounds;
+
+    public bool IsTrigger => Type is (int)LgbInstanceType.ExitRange or (int)LgbInstanceType.MapRange or (int)LgbInstanceType.EventRange or (int)LgbInstanceType.DoorRange;
 
     public string TypeName => Type switch
     {
         (int)LgbInstanceType.ExitRange => "exit range",
         (int)LgbInstanceType.PopRange => "pop range",
         (int)LgbInstanceType.EventObject => "event object",
+        (int)LgbInstanceType.MapRange => "map range",
+        (int)LgbInstanceType.EventRange => "event range",
+        (int)LgbInstanceType.DoorRange => "door range",
+        (int)LgbInstanceType.Treasure => "treasure",
+        (int)LgbInstanceType.EventNpc => "event npc",
+        (int)LgbInstanceType.BattleNpc => "battle npc",
         _ => $"type {Type}",
     };
 }
@@ -90,6 +141,7 @@ public sealed class ZoneAnalyticInstance
     public string Name = "";
     public ulong LayoutObjectId;
     public int LayerIndex;
+    public int NodeIndex = -1;
     public LgbColliderKind Kind;
     public Matrix4x4 World = Matrix4x4.Identity;
     public ulong MatValue, MatMask;
@@ -135,12 +187,21 @@ public readonly struct WorldTriangle(Vector3 a, Vector3 b, Vector3 c, ulong mate
 
 public sealed class ZoneTriangleStore
 {
-    private WorldTriangle[] _tris = new WorldTriangle[1 << 16];
+    private WorldTriangle[] _tris = [];
     private int _count;
 
     public int Count => _count;
     public ReadOnlySpan<WorldTriangle> Span => _tris.AsSpan(0, _count);
     public ref readonly WorldTriangle this[int i] => ref _tris[i];
+
+    // room for total triangles in all, so a load with a known count appends without regrowing
+    public void Reserve(int total)
+    {
+        if (total > _tris.Length)
+        {
+            Array.Resize(ref _tris, total);
+        }
+    }
 
     // transforms the instance's mesh into world space and appends it; sets TriStart/TriCount/WorldBounds on the instance
     public int Append(ZoneMeshInstance inst)
@@ -149,11 +210,10 @@ public sealed class ZoneTriangleStore
         var n = mesh.TriangleCount;
         if (_count + n > _tris.Length)
         {
-            Array.Resize(ref _tris, Math.Max(_tris.Length * 2, _count + n));
+            Array.Resize(ref _tris, Math.Max(Math.Max(_tris.Length * 2, 1 << 16), _count + n));
         }
         var start = _count;
-        var min = new Vector3(float.MaxValue);
-        var max = new Vector3(float.MinValue);
+        var bounds = Bounds3.Empty;
         var world = inst.World;
         var objMask = inst.ObjMatMask;
         var objValue = inst.ObjMatValue & objMask;
@@ -168,13 +228,13 @@ public sealed class ZoneTriangleStore
             var len = normal.Length();
             var normalY = len > 1e-12f ? MathF.Abs(normal.Y / len) : 0f;
             var material = mesh.Materials[i];
-            _tris[_count++] = new(a, b, c, material, (material & ~objMask) | objValue, normalY, inst.Index);
-            min = Vector3.Min(min, Vector3.Min(a, Vector3.Min(b, c)));
-            max = Vector3.Max(max, Vector3.Max(a, Vector3.Max(b, c)));
+            var tri = new WorldTriangle(a, b, c, material, (material & ~objMask) | objValue, normalY, inst.Index);
+            _tris[_count++] = tri;
+            bounds = Bounds3.Union(bounds, tri.Bounds);
         }
         inst.TriStart = start;
         inst.TriCount = n;
-        inst.WorldBounds = n > 0 ? new(min, max) : Bounds3.Transform(mesh.LocalBounds, world);
+        inst.WorldBounds = n > 0 ? bounds : Bounds3.Transform(mesh.LocalBounds, world);
         return start;
     }
 }
@@ -195,33 +255,118 @@ public sealed class ZoneCollisionScene
     public string LevelDir = "";
     public string CollisionDir = "";
     public readonly List<ZoneLayer> Layers = [];
+    public readonly List<ZoneNode> Nodes = [];
+    public readonly Dictionary<uint, int> TopLevelNodeByKey = []; // instance keys of the lgb files are unique per territory; bound/linked/dest ids refer to them
+    public readonly Dictionary<ulong, int> NodeByPathId = [];
     public readonly List<ZoneMeshInstance> Meshes = [];
     public readonly List<ZoneBoxInstance> Boxes = [];
     public readonly List<ZoneAnalyticInstance> Analytics = [];
     public readonly List<ZoneMarker> Markers = [];
     public PcbList? TerrainList;
     public readonly Dictionary<uint, int> TerrainTileMeshIndex = [];
-    public readonly Dictionary<string, PcbMesh> PcbCache = [];
+    public readonly Dictionary<string, PcbMesh?> PcbCache = []; // null: the file is missing or malformed (reported once)
     public readonly ZoneTriangleStore Triangles = new();
     public readonly ZoneLoadReport Report = new();
     public int TerrainLayerIndex = -1;
     public Bounds3 Bounds;
+    private ZoneActivity _activity = new();
+    public int ActivityVersion; // bumped on every Activity publish, so a reader can tell a resolve happened
+
+    // per-instance activity under the current scene state (ZoneSceneResolver.Resolve); empty until resolved. Published as one reference after the
+    // arrays are complete: a reader takes the reference once and sees either the previous or the new consistent set
+    public ZoneActivity Activity
+    {
+        get => _activity;
+        set
+        {
+            _activity = value;
+            ++ActivityVersion;
+        }
+    }
 
     public static ulong MakeLayoutObjectId(int type, ushort layerKey, uint instanceKey) => ((ulong)instanceKey << 32) | ((ulong)layerKey << 16) | ((ulong)(byte)type << 8);
 
-    public static (uint instanceKey, ushort layerKey, byte type) DecodeLayoutObjectId(ulong id) => ((uint)(id >> 32), (ushort)(id >> 16), (byte)(id >> 8));
+    // collision present under the current scene state; meshes appended after the last resolve (terrain tiles) fall back to their layer flag
+    public bool IsMeshEnabled(int meshIndex)
+    {
+        var a = _activity;
+        return meshIndex < a.MeshActive.Length ? a.MeshActive[meshIndex] : Layers[Meshes[meshIndex].LayerIndex].Enabled;
+    }
 
-    public bool IsMeshEnabled(int meshIndex) => Layers[Meshes[meshIndex].LayerIndex].Enabled;
-    public bool IsBoxEnabled(int boxIndex) => Layers[Boxes[boxIndex].LayerIndex].Enabled;
+    public bool IsBoxEnabled(int boxIndex)
+    {
+        var a = _activity;
+        return boxIndex < a.BoxActive.Length ? a.BoxActive[boxIndex] : Layers[Boxes[boxIndex].LayerIndex].Enabled;
+    }
+
+    public bool IsLayerEnabled(int layerIndex) => Layers[layerIndex].Enabled;
+
+    // the instance exists in the scene (layer on, not overridden off) even if an event object currently has its collision removed
+    public bool IsNodePlaced(int nodeIndex)
+    {
+        if (nodeIndex < 0)
+        {
+            return true;
+        }
+        var a = _activity;
+        return nodeIndex < a.NodePlaced.Length ? a.NodePlaced[nodeIndex] : Layers[Nodes[nodeIndex].LayerIndex].Enabled;
+    }
+
+    public bool IsNodeActive(int nodeIndex)
+    {
+        if (nodeIndex < 0)
+        {
+            return true;
+        }
+        var a = _activity;
+        return nodeIndex < a.NodeActive.Length ? a.NodeActive[nodeIndex] : Layers[Nodes[nodeIndex].LayerIndex].Enabled;
+    }
+
+    public bool IsBoxPlaced(int boxIndex) => Boxes[boxIndex].NodeIndex >= 0 ? IsNodePlaced(Boxes[boxIndex].NodeIndex) : Layers[Boxes[boxIndex].LayerIndex].Enabled;
+    public bool IsMeshPlaced(int meshIndex) => Meshes[meshIndex].NodeIndex >= 0 ? IsNodePlaced(Meshes[meshIndex].NodeIndex) : Layers[Meshes[meshIndex].LayerIndex].Enabled;
+
+    public int FindTopLevelNode(uint instanceKey) => instanceKey != 0 && TopLevelNodeByKey.TryGetValue(instanceKey, out var n) ? n : -1;
+    public int FindNode(ulong pathId) => NodeByPathId.TryGetValue(pathId, out var n) ? n : -1;
+
+    // "<source file>/<layer>/<key hex>" per node along the ancestor chain, joined by '>'
+    public string NodePath(int nodeIndex)
+    {
+        var node = Nodes[nodeIndex];
+        var layer = Layers[node.LayerIndex];
+        var own = $"{layer.SourceFile}/{layer.Name}/{node.InstanceKey:X}";
+        return node.Parent >= 0 ? $"{NodePath(node.Parent)}>{own}" : own;
+    }
+
+    // colliders of the node itself and everything instantiated under it (shared-group children)
+    public void CollectSubtreeColliders(int node, List<int> meshes, List<int> boxes)
+    {
+        if (node < 0 || node >= Nodes.Count)
+        {
+            return;
+        }
+        var end = Nodes[node].SubtreeEnd;
+        for (var i = node; i < end; ++i)
+        {
+            var n = Nodes[i];
+            if (n.MeshIndex >= 0)
+            {
+                meshes.Add(n.MeshIndex);
+            }
+            if (n.BoxIndex >= 0)
+            {
+                boxes.Add(n.BoxIndex);
+            }
+        }
+    }
 
     public void RecomputeBounds()
     {
-        Bounds3? b = null;
+        var b = Bounds3.Empty;
         var n = Meshes.Count;
         for (var i = 0; i < n; ++i)
         {
-            b = b == null ? Meshes[i].WorldBounds : Bounds3.Union(b.Value, Meshes[i].WorldBounds);
+            b = Bounds3.Union(b, Meshes[i].WorldBounds);
         }
-        Bounds = b ?? default;
+        Bounds = n > 0 ? b : default;
     }
 }

@@ -1,90 +1,39 @@
 namespace BossMod;
 
-// uniform XZ grid over one mesh's triangles (CSR layout) for hover/click/rect/brush picking in the offline editor
-public sealed class TriangleGrid
-{
-    public const float CellSize = 2f;
-    public readonly float MinX, MinZ;
-    public readonly int CellsX, CellsZ;
-    private readonly int[] _cellStart;
-    private readonly int[] _items;
-
-    public TriangleGrid(ReadOnlySpan<WorldTriangle> tris, int first, int count, in Bounds3 bounds)
-    {
-        MinX = bounds.Min.X;
-        MinZ = bounds.Min.Z;
-        CellsX = Math.Max(1, (int)MathF.Ceiling((bounds.Max.X - MinX) / CellSize) + 1);
-        CellsZ = Math.Max(1, (int)MathF.Ceiling((bounds.Max.Z - MinZ) / CellSize) + 1);
-        var counts = new int[CellsX * CellsZ + 1];
-        var end = first + count;
-        for (var i = first; i < end; ++i)
-        {
-            ref readonly var t = ref tris[i];
-            CellRange(t, out var x0, out var z0, out var x1, out var z1);
-            for (var z = z0; z <= z1; ++z)
-            {
-                for (var x = x0; x <= x1; ++x)
-                {
-                    ++counts[z * CellsX + x + 1];
-                }
-            }
-        }
-        for (var c = 1; c < counts.Length; ++c)
-        {
-            counts[c] += counts[c - 1];
-        }
-        _cellStart = counts;
-        _items = new int[_cellStart[^1]];
-        var fill = new int[CellsX * CellsZ];
-        for (var i = first; i < end; ++i)
-        {
-            ref readonly var t = ref tris[i];
-            CellRange(t, out var x0, out var z0, out var x1, out var z1);
-            for (var z = z0; z <= z1; ++z)
-            {
-                for (var x = x0; x <= x1; ++x)
-                {
-                    var cell = z * CellsX + x;
-                    _items[_cellStart[cell] + fill[cell]++] = i;
-                }
-            }
-        }
-    }
-
-    private void CellRange(in WorldTriangle t, out int x0, out int z0, out int x1, out int z1)
-    {
-        var minX = MathF.Min(t.A.X, MathF.Min(t.B.X, t.C.X));
-        var maxX = MathF.Max(t.A.X, MathF.Max(t.B.X, t.C.X));
-        var minZ = MathF.Min(t.A.Z, MathF.Min(t.B.Z, t.C.Z));
-        var maxZ = MathF.Max(t.A.Z, MathF.Max(t.B.Z, t.C.Z));
-        x0 = Math.Clamp((int)((minX - MinX) / CellSize), 0, CellsX - 1);
-        x1 = Math.Clamp((int)((maxX - MinX) / CellSize), 0, CellsX - 1);
-        z0 = Math.Clamp((int)((minZ - MinZ) / CellSize), 0, CellsZ - 1);
-        z1 = Math.Clamp((int)((maxZ - MinZ) / CellSize), 0, CellsZ - 1);
-    }
-
-    public void CellsInRect(float minX, float minZ, float maxX, float maxZ, out int cx0, out int cz0, out int cx1, out int cz1)
-    {
-        cx0 = Math.Clamp((int)((minX - MinX) / CellSize), 0, CellsX - 1);
-        cx1 = Math.Clamp((int)((maxX - MinX) / CellSize), 0, CellsX - 1);
-        cz0 = Math.Clamp((int)((minZ - MinZ) / CellSize), 0, CellsZ - 1);
-        cz1 = Math.Clamp((int)((maxZ - MinZ) / CellSize), 0, CellsZ - 1);
-    }
-
-    public ReadOnlySpan<int> Cell(int cx, int cz)
-    {
-        var cell = cz * CellsX + cx;
-        return _items.AsSpan(_cellStart[cell], _cellStart[cell + 1] - _cellStart[cell]);
-    }
-}
-
+// hover/click/rect/brush picking over the loaded scene: one TriangleGrid per mesh, built on first use, and a coarse grid over the mesh
+// bounds so a point pick only visits the meshes standing there instead of every mesh of the scene
 public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
 {
+    private const float MeshCell = 16f;
     private readonly Dictionary<int, TriangleGrid> _grids = [];
-    private int[] _visitStamp = new int[scene.Triangles.Count];
-    private int _stamp;
+    private readonly Dictionary<int, (int start, int count)> _gridKeys = [];
+    private readonly VisitStamp _visited = new(scene.Triangles.Count);
+    private XZHashGrid? _meshGrid;
+    private int _meshGridCount = -1;
+    private float[] _sortKeys = [];
+    private int[] _sortOrder = [];
 
     public ZoneCollisionScene Scene => scene;
+
+    // after meshes were appended (terrain tiles): grids of meshes whose triangle range is unchanged stay, the rest rebuild on first use
+    public void Refresh()
+    {
+        List<int> stale = [];
+        foreach (var (m, key) in _gridKeys)
+        {
+            if (m >= scene.Meshes.Count || scene.Meshes[m].TriStart != key.start || scene.Meshes[m].TriCount != key.count)
+            {
+                stale.Add(m);
+            }
+        }
+        foreach (var m in stale)
+        {
+            _grids.Remove(m);
+            _gridKeys.Remove(m);
+        }
+        _meshGrid = null;
+        _visited.EnsureCapacity(scene.Triangles.Count);
+    }
 
     private TriangleGrid? Grid(int meshIndex)
     {
@@ -97,21 +46,35 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
         {
             grid = new TriangleGrid(scene.Triangles.Span, mesh.TriStart, mesh.TriCount, mesh.WorldBounds);
             _grids[meshIndex] = grid;
+            _gridKeys[meshIndex] = (mesh.TriStart, mesh.TriCount);
         }
         return grid;
     }
 
+    // the non-empty meshes by their XZ bounds; rebuilt when meshes were appended without a Refresh
+    private XZHashGrid MeshGrid()
+    {
+        if (_meshGrid == null || _meshGridCount != scene.Meshes.Count)
+        {
+            _meshGrid = new(MeshCell);
+            var meshes = scene.Meshes;
+            for (var m = 0; m < meshes.Count; ++m)
+            {
+                var b = meshes[m].WorldBounds;
+                if (meshes[m].TriCount > 0)
+                {
+                    _meshGrid.Add(m, b.Min.X, b.Min.Z, b.Max.X, b.Max.Z);
+                }
+            }
+            _meshGridCount = meshes.Count;
+        }
+        return _meshGrid;
+    }
+
     private void NextStamp()
     {
-        if (_visitStamp.Length < scene.Triangles.Count)
-        {
-            Array.Resize(ref _visitStamp, scene.Triangles.Count);
-        }
-        if (++_stamp == int.MaxValue)
-        {
-            Array.Clear(_visitStamp);
-            _stamp = 1;
-        }
+        _visited.EnsureCapacity(scene.Triangles.Count);
+        _visited.Next();
     }
 
     // all triangles containing the point in XZ, sorted by Y descending; returns the topmost or -1
@@ -121,7 +84,12 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
         var tris = scene.Triangles.Span;
         var meshes = scene.Meshes;
         NextStamp();
-        for (var m = 0; m < meshes.Count; ++m)
+        var meshGrid = MeshGrid();
+        if (meshGrid.Cell(meshGrid.CellOf(p.X), meshGrid.CellOf(p.Z)) is not { } candidates)
+        {
+            return -1;
+        }
+        foreach (var m in candidates)
         {
             var mesh = meshes[m];
             if (!scene.IsMeshEnabled(m) || !mesh.WorldBounds.ContainsXZ(p.X, p.Z))
@@ -136,11 +104,10 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
             grid.CellsInRect(p.X, p.Z, p.X, p.Z, out var cx, out var cz, out _, out _);
             foreach (var i in grid.Cell(cx, cz))
             {
-                if (_visitStamp[i] == _stamp)
+                if (!_visited.Visit(i))
                 {
                     continue;
                 }
-                _visitStamp[i] = _stamp;
                 if (filter != null && !filter(i))
                 {
                     continue;
@@ -153,30 +120,89 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
         }
         if (hits.Count > 1)
         {
-            var ys = new float[hits.Count];
-            var order = new int[hits.Count];
-            for (var i = 0; i < hits.Count; ++i)
+            if (_sortKeys.Length < hits.Count)
             {
-                ys[i] = -tris[hits[i]].YAt(p.X, p.Z); // descending Y
-                order[i] = hits[i];
+                _sortKeys = new float[Math.Max(hits.Count, 2 * _sortKeys.Length)];
+                _sortOrder = new int[_sortKeys.Length];
             }
-            Array.Sort(ys, order);
             for (var i = 0; i < hits.Count; ++i)
             {
-                hits[i] = order[i];
+                _sortKeys[i] = -tris[hits[i]].YAt(p.X, p.Z); // descending Y
+                _sortOrder[i] = hits[i];
+            }
+            Array.Sort(_sortKeys, _sortOrder, 0, hits.Count);
+            for (var i = 0; i < hits.Count; ++i)
+            {
+                hits[i] = _sortOrder[i];
             }
         }
         return hits.Count > 0 ? hits[0] : -1;
     }
 
+    // the triangle under the point whose surface is nearest to preferY (the topmost when preferY is null), or -1
+    public int PickTriangleNearY(WPos p, float? preferY, List<int> scratch)
+    {
+        PickTriangle(p, scratch, null);
+        if (scratch.Count == 0)
+        {
+            return -1;
+        }
+        if (preferY is not { } py)
+        {
+            return scratch[0];
+        }
+        var tris = scene.Triangles.Span;
+        var best = -1;
+        var bestScore = float.MaxValue;
+        for (var i = 0; i < scratch.Count; ++i)
+        {
+            var score = MathF.Abs(tris[scratch[i]].YAt(p.X, p.Z) - py);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = scratch[i];
+            }
+        }
+        return best;
+    }
+
+    private struct VertexQuery(ZoneTriangleStore store, VisitStamp visited, Predicate<int>? filter, WPos p, float best) : ITriangleVisitor
+    {
+        public float Best = best;
+        public Vector3 Vertex;
+        public int Triangle = -1;
+
+        public void Visit(int i)
+        {
+            if (!visited.Visit(i) || (filter != null && !filter(i)))
+            {
+                return;
+            }
+            ref readonly var t = ref store[i];
+            Consider(t.A, i);
+            Consider(t.B, i);
+            Consider(t.C, i);
+        }
+
+        private void Consider(in Vector3 v, int i)
+        {
+            var dx = v.X - p.X;
+            var dz = v.Z - p.Z;
+            var d = dx * dx + dz * dz;
+            if (d < Best)
+            {
+                Best = d;
+                Vertex = v;
+                Triangle = i;
+            }
+        }
+    }
+
     public bool NearestVertex(WPos p, float maxDist, Predicate<int>? filter, out Vector3 vertex, out int triangle)
     {
-        vertex = default;
-        triangle = -1;
-        var best = maxDist * maxDist;
-        var tris = scene.Triangles.Span;
         var meshes = scene.Meshes;
         NextStamp();
+        var q = new VertexQuery(scene.Triangles, _visited, filter, p, maxDist * maxDist);
         for (var m = 0; m < meshes.Count; ++m)
         {
             var mesh = meshes[m];
@@ -185,55 +211,44 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
                 continue;
             }
             var grid = Grid(m);
-            if (grid == null)
+            grid?.ForEachInRect(p.X - maxDist, p.Z - maxDist, p.X + maxDist, p.Z + maxDist, null, ref q);
+        }
+        vertex = q.Vertex;
+        triangle = q.Triangle;
+        return triangle >= 0;
+    }
+
+    // centroids inside the rect, or inside the circle when r > 0
+    private struct CentroidQuery(ZoneTriangleStore store, VisitStamp visited, Predicate<int>? filter, WPos min, WPos max, WPos centre, float r2, List<int> dst) : ITriangleVisitor
+    {
+        public void Visit(int i)
+        {
+            if (!visited.Visit(i) || (filter != null && !filter(i)))
             {
-                continue;
+                return;
             }
-            grid.CellsInRect(p.X - maxDist, p.Z - maxDist, p.X + maxDist, p.Z + maxDist, out var cx0, out var cz0, out var cx1, out var cz1);
-            for (var cz = cz0; cz <= cz1; ++cz)
+            var c = store[i].Centroid;
+            if (r2 > 0f)
             {
-                for (var cx = cx0; cx <= cx1; ++cx)
+                var dx = c.X - centre.X;
+                var dz = c.Z - centre.Z;
+                if (dx * dx + dz * dz <= r2)
                 {
-                    foreach (var i in grid.Cell(cx, cz))
-                    {
-                        if (_visitStamp[i] == _stamp)
-                        {
-                            continue;
-                        }
-                        _visitStamp[i] = _stamp;
-                        if (filter != null && !filter(i))
-                        {
-                            continue;
-                        }
-                        ref readonly var t = ref tris[i];
-                        Consider(t.A, p, ref best, ref vertex, ref triangle, i);
-                        Consider(t.B, p, ref best, ref vertex, ref triangle, i);
-                        Consider(t.C, p, ref best, ref vertex, ref triangle, i);
-                    }
+                    dst.Add(i);
                 }
             }
-        }
-        return triangle >= 0;
-
-        static void Consider(in Vector3 v, WPos p, ref float best, ref Vector3 vertex, ref int triangle, int i)
-        {
-            var dx = v.X - p.X;
-            var dz = v.Z - p.Z;
-            var d = dx * dx + dz * dz;
-            if (d < best)
+            else if (c.X >= min.X && c.X <= max.X && c.Z >= min.Z && c.Z <= max.Z)
             {
-                best = d;
-                vertex = v;
-                triangle = i;
+                dst.Add(i);
             }
         }
     }
 
     public void CentroidsInRect(WPos min, WPos max, Predicate<int>? filter, List<int> dst)
     {
-        var tris = scene.Triangles.Span;
         var meshes = scene.Meshes;
         NextStamp();
+        var q = new CentroidQuery(scene.Triangles, _visited, filter, min, max, default, 0f, dst);
         for (var m = 0; m < meshes.Count; ++m)
         {
             var mesh = meshes[m];
@@ -242,43 +257,15 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
                 continue;
             }
             var grid = Grid(m);
-            if (grid == null)
-            {
-                continue;
-            }
-            grid.CellsInRect(min.X, min.Z, max.X, max.Z, out var cx0, out var cz0, out var cx1, out var cz1);
-            for (var cz = cz0; cz <= cz1; ++cz)
-            {
-                for (var cx = cx0; cx <= cx1; ++cx)
-                {
-                    foreach (var i in grid.Cell(cx, cz))
-                    {
-                        if (_visitStamp[i] == _stamp)
-                        {
-                            continue;
-                        }
-                        _visitStamp[i] = _stamp;
-                        if (filter != null && !filter(i))
-                        {
-                            continue;
-                        }
-                        var c = tris[i].Centroid;
-                        if (c.X >= min.X && c.X <= max.X && c.Z >= min.Z && c.Z <= max.Z)
-                        {
-                            dst.Add(i);
-                        }
-                    }
-                }
-            }
+            grid?.ForEachInRect(min.X, min.Z, max.X, max.Z, null, ref q);
         }
     }
 
     public void CentroidsInCircle(WPos c, float r, Predicate<int>? filter, List<int> dst)
     {
-        var tris = scene.Triangles.Span;
         var meshes = scene.Meshes;
-        var r2 = r * r;
         NextStamp();
+        var q = new CentroidQuery(scene.Triangles, _visited, filter, default, default, c, r * r, dst);
         for (var m = 0; m < meshes.Count; ++m)
         {
             var mesh = meshes[m];
@@ -287,36 +274,7 @@ public sealed class ZoneTrianglePicker(ZoneCollisionScene scene)
                 continue;
             }
             var grid = Grid(m);
-            if (grid == null)
-            {
-                continue;
-            }
-            grid.CellsInRect(c.X - r, c.Z - r, c.X + r, c.Z + r, out var cx0, out var cz0, out var cx1, out var cz1);
-            for (var cz = cz0; cz <= cz1; ++cz)
-            {
-                for (var cx = cx0; cx <= cx1; ++cx)
-                {
-                    foreach (var i in grid.Cell(cx, cz))
-                    {
-                        if (_visitStamp[i] == _stamp)
-                        {
-                            continue;
-                        }
-                        _visitStamp[i] = _stamp;
-                        if (filter != null && !filter(i))
-                        {
-                            continue;
-                        }
-                        var cc = tris[i].Centroid;
-                        var dx = cc.X - c.X;
-                        var dz = cc.Z - c.Z;
-                        if (dx * dx + dz * dz <= r2)
-                        {
-                            dst.Add(i);
-                        }
-                    }
-                }
-            }
+            grid?.ForEachInRect(c.X - r, c.Z - r, c.X + r, c.Z + r, null, ref q);
         }
     }
 }

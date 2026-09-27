@@ -16,6 +16,7 @@ public sealed class UICanvas2D
     public bool RightDragPans = true;
     public bool SpaceLeftPans = true;
     public bool SpaceHeld; // set by the owner each frame (raw key state - the game eats keyboard input before ImGui sees it)
+    public bool ShiftHeld; // same; shift+wheel is the owner's (brush radius), not a zoom
 
     public bool Hovered { get; private set; }
     public bool Active { get; private set; }
@@ -30,6 +31,7 @@ public sealed class UICanvas2D
     private bool _dragEnabled, _dragPressed;
     private Vector2 _dragStartScreen;
     private ImDrawListPtr _dl;
+    private const int MaxBatchVertices = 60000; // a multiple of three
 
     public bool Begin(string id, Vector2 size)
     {
@@ -50,7 +52,7 @@ public sealed class UICanvas2D
         MouseWorld = FromScreen(MouseScreen);
 
         // zoom about the cursor
-        if (Hovered && io.MouseWheel != 0f && !io.KeyShift)
+        if (Hovered && io.MouseWheel != 0f && !ShiftHeld && !io.KeyShift)
         {
             var k = MathF.Pow(1.1f, io.MouseWheel);
             var newZoom = Math.Clamp(Zoom * k, MinZoom, MaxZoom);
@@ -123,7 +125,7 @@ public sealed class UICanvas2D
 
     public void End()
     {
-        if (DragActive || _dragPressed && DragActive)
+        if (DragActive)
         {
             var a = ToScreen(DragStart);
             var b = ToScreen(DragEnd);
@@ -149,10 +151,16 @@ public sealed class UICanvas2D
     public Vector2 ToScreen(in Vector3 p) => new(ScreenCenter.X + (p.X - Center.X) * Zoom, ScreenCenter.Y + (p.Z - Center.Z) * Zoom);
     public WPos FromScreen(Vector2 s) => new(Center.X + (s.X - ScreenCenter.X) / Zoom, Center.Z + (s.Y - ScreenCenter.Y) / Zoom);
 
-    public bool IsClicked(ImGuiMouseButton b) => Hovered && !Panning && ImGui.IsMouseClicked(b);
-
     public bool IsVisible(float minX, float minZ, float maxX, float maxZ) => maxX >= ViewMin.X && minX <= ViewMax.X && maxZ >= ViewMin.Z && minZ <= ViewMax.Z;
     public bool IsVisible(in Vector3 min, in Vector3 max) => IsVisible(min.X, min.Z, max.X, max.Z);
+
+    // the box lies wholly inside the view, so everything inside it passes IsVisible
+    public bool IsInsideView(float minX, float minZ, float maxX, float maxZ) => minX >= ViewMin.X && maxX <= ViewMax.X && minZ >= ViewMin.Z && maxZ <= ViewMax.Z;
+
+    // everything ToScreen and IsVisible read: equal views map equal world input to equal pixels, so screen-space results can be reused
+    public readonly record struct ViewState(float CenterX, float CenterZ, float Zoom, Vector2 ScreenCenter, float MinX, float MinZ, float MaxX, float MaxZ);
+
+    public ViewState View => new(Center.X, Center.Z, Zoom, ScreenCenter, ViewMin.X, ViewMin.Z, ViewMax.X, ViewMax.Z);
 
     public void FitBounds(WPos min, WPos max, float paddingPx = 24f)
     {
@@ -209,6 +217,46 @@ public sealed class UICanvas2D
 
     public void Triangle(in Vector3 a, in Vector3 b, in Vector3 c, uint color, float thickness = 1f) => _dl.AddTriangle(ToScreen(a), ToScreen(b), ToScreen(c), color, thickness);
     public void TriangleFilled(in Vector3 a, in Vector3 b, in Vector3 c, uint color) => _dl.AddTriangleFilled(ToScreen(a), ToScreen(b), ToScreen(c), color);
+    public void ScreenTriangle(Vector2 a, Vector2 b, Vector2 c, uint color, float thickness = 1f) => _dl.AddTriangle(a, b, c, color, thickness);
+    public void ScreenTriangleFilled(Vector2 a, Vector2 b, Vector2 c, uint color) => _dl.AddTriangleFilled(a, b, c, color);
+
+    // filled triangles from screen-space vertices (three per triangle), in order. With anti-aliased fill on, AddTriangleFilled adds a fringe per
+    // triangle, so each goes through it; with it off a triangle is exactly three white-uv vertices and three indices, written in bulk
+    public unsafe void ScreenTrianglesFilled(ReadOnlySpan<Vector2> verts, uint color)
+    {
+        var n = verts.Length / 3 * 3;
+        if (n == 0 || (color & 0xFF000000u) == 0)
+        {
+            return;
+        }
+        if ((_dl.Flags & ImDrawListFlags.AntiAliasedFill) != 0)
+        {
+            for (var i = 0; i < n; i += 3)
+            {
+                _dl.AddTriangleFilled(verts[i], verts[i + 1], verts[i + 2], color);
+            }
+            return;
+        }
+        var uv = ImGui.GetFontTexUvWhitePixel();
+        for (var start = 0; start < n; start += MaxBatchVertices)
+        {
+            // one reserve stays under the 16-bit index range; the reserve itself moves the vertex offset when the running index would overflow
+            var count = Math.Min(MaxBatchVertices, n - start);
+            _dl.PrimReserve(count, count);
+            var dl = _dl.Handle;
+            var vtx = dl->VtxWritePtr;
+            var idx = dl->IdxWritePtr;
+            var first = dl->VtxCurrentIdx;
+            for (var k = 0; k < count; ++k)
+            {
+                vtx[k] = new(verts[start + k], uv, color);
+                idx[k] = (ushort)(first + (uint)k);
+            }
+            dl->VtxWritePtr = vtx + count;
+            dl->IdxWritePtr = idx + count;
+            dl->VtxCurrentIdx = first + (uint)count;
+        }
+    }
 
     public void Poly(ReadOnlySpan<WPos> pts, uint color, float thickness = 1f, bool closed = true)
     {

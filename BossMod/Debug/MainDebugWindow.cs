@@ -32,7 +32,7 @@ public struct BeastmasterGauge
     [FieldOffset(14)] public byte Unk14;
 }
 
-sealed class MainDebugWindow(WorldState ws, BossModuleManager bmm, RotationModuleManager autorot, ZoneModuleManager zmm, ActionManagerEx amex, MovementOverride move, AIHintsBuilder hintBuilder, IDalamudPluginInterface dalamud, RotationSolverRebornModule rsr) : UIWindow("Boss mod debug UI", false, new(300, 200))
+sealed class MainDebugWindow(WorldState ws, BossModuleManager bmm, RotationModuleManager autorot, ZoneModuleManager zmm, ActionManagerEx amex, MovementOverride move, AIHintsBuilder hintBuilder, IDalamudPluginInterface dalamud, RotationSolverRebornModule rsr, ReplayManagementWindow replayWindow) : UIWindow("Boss mod debug UI", false, new(300, 200))
 {
     private readonly DebugObstacles _debugObstacles = new(hintBuilder.Obstacles, dalamud);
     private readonly DebugObjects _debugObjects = new();
@@ -80,8 +80,14 @@ sealed class MainDebugWindow(WorldState ws, BossModuleManager bmm, RotationModul
 
         if (ImGui.Button("Zone arena editor (offline)"))
         {
-            _zoneArenaEditor ??= new(bmm, dalamud);
+            // a fresh editor follows the replay viewer's replay; an existing one keeps what the author loaded (the editor has its own sync button)
+            var created = _zoneArenaEditor == null;
+            _zoneArenaEditor ??= new(bmm, dalamud, replayWindow);
             _zoneArenaEditor.OpenAndBringToFront();
+            if (created)
+            {
+                _zoneArenaEditor.SyncWithReplayViewer();
+            }
         }
         ImGui.SameLine();
         if (ImGui.Button("Perform full dump"))

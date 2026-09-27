@@ -41,6 +41,8 @@ sealed class ReplayDetailsWindow : UIWindow
         set => MoveTo(value);
     }
 
+    public BossModule? ActiveModule => _mgr.ActiveModule;
+
     public ReplayDetailsWindow(Replay data, RotationDatabase rotationDB, DateTime? initialTime) : base($"Replay: {data.Path}", false, new(1500, 1000))
     {
         _player = new(data);

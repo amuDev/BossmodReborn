@@ -10,7 +10,7 @@ namespace BossMod;
 // and the walkable floor, lets the author correct the triangle selection and produces the same module snippet as the live collision tab
 public sealed partial class ZoneArenaEditorWindow : UIWindow
 {
-    private readonly record struct ZoneEntry(uint TerritoryId, string Bg, string Place, string Cfc, uint CfcId, uint IntendedUse);
+    private readonly record struct ZoneEntry(uint TerritoryId, string Bg, string Place, string Cfc, uint CfcId, uint IntendedUse, string Label); // Label = the zone list row, built once
 
     private enum Tool : byte { Pick, Rect, Brush, Centre, Polygon, Vertex }
     private enum MeshMode : byte { Auto, Include, Exclude }
@@ -19,6 +19,7 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
     private readonly IDalamudPluginInterface _dalamud;
     private readonly UICanvas2D _canvas = new();
     private readonly ArenaPolygonPipeline _pipeline = new();
+    private readonly LuminaZoneFileSource _fileSource = new(Service.LuminaGameData);
 
     private ZoneCollisionScene? _scene;
     private ZoneTrianglePicker? _picker;
@@ -32,8 +33,10 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
     private string _zoneSearch = "";
     private string _lastZoneSearch = "";
     private bool _zoneMatchesStale = true;
-    private uint _loadedTerritory;
+    private uint _loadedTerritory; // the territory of _scene; set when a load lands
+    private uint _loadingTerritory; // the territory _loadTask is loading
     private Task<ZoneCollisionScene>? _loadTask;
+    private bool _loadIsReload;
     private CancellationTokenSource? _loadCts;
     private readonly ZoneLoadProgress _progress = new();
     private string _loadStatus = "";
@@ -43,33 +46,46 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
     private Tool _tool = Tool.Pick;
     private Tool _toolBeforeCentre = Tool.Pick;
     private float _brushRadius = 2f;
-    private readonly Dictionary<int, bool> _keyWasDown = [];
-    private readonly HashSet<int> _keyPressedThisFrame = [];
+    private readonly bool[] _keyWasDown = new bool[256]; // indexed by virtual key
+    private readonly bool[] _keyPressedThisFrame = new bool[256];
     private bool _keysActive;
 
     private bool _resultDirty;
     private long _resultDirtySince;
     private int _recomputeGen;
-    private Task<(List<CollisionOutlinesExtractor.PolygonWithHoles> polys, string keep, long ms, int obstacles, int obstacleBoxes, int wallSnapEdges, HashSet<int> rim)>? _recomputeTask;
+    private Task<(List<PolygonWithHoles> polys, string keep, long ms, int obstacles, int obstacleBoxes, int wallSnapEdges, HashSet<int> rim)>? _recomputeTask;
     private int _recomputeTaskGen;
+    private CancellationTokenSource? _recomputeCts, _autoMapCts;
     private long _lastRecomputeMs;
     private int _lastObstacleTriangles;
     private int _lastObstacleBoxes;
     private int _lastWallSnapEdges;
     private int _lastRimTriangles;
     private bool _autoRecompute = true;
+    private float _autoRecomputeDelay = 0.5f; // seconds of no edits before an automatic recompute starts
+    private Task<AutoMapJob>? _autoMapTask;
+    private ArenaPolygonPipeline.SimplifySettings _pendingSimplify;
+    private long _pendingSimplifySince;
 
-    public ZoneArenaEditorWindow(BossModuleManager bmm, IDalamudPluginInterface dalamud)
+    public ZoneArenaEditorWindow(BossModuleManager bmm, IDalamudPluginInterface dalamud, ReplayManagementWindow? replayWindow = null)
         : base("Zone arena editor", false, new(1400 * ImGuiHelpers.GlobalScale, 900 * ImGuiHelpers.GlobalScale))
     {
         _bmm = bmm;
         _dalamud = dalamud;
+        _replayWindow = replayWindow;
         BuildZoneList();
     }
 
     protected override void Dispose(bool disposing)
     {
         _loadCts?.Cancel();
+        _mapCts?.Cancel();
+        _timelineCts?.Cancel();
+        _timelineCts?.Dispose();
+        _recomputeCts?.Cancel();
+        _recomputeCts?.Dispose();
+        _autoMapCts?.Cancel();
+        _autoMapCts?.Dispose();
         base.Dispose(disposing);
     }
 
@@ -89,7 +105,8 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
             }
             var place = row.PlaceName.ValueNullable?.Name.ToString() ?? "";
             var cfc = row.ContentFinderCondition.ValueNullable?.Name.ToString() ?? "";
-            _zones.Add(new(row.RowId, bg, place, cfc, row.ContentFinderCondition.RowId, row.TerritoryIntendedUse.RowId));
+            var label = cfc.Length > 0 ? $"{row.RowId}: {cfc} ({place})##zone{row.RowId}" : $"{row.RowId}: {place}##zone{row.RowId}";
+            _zones.Add(new(row.RowId, bg, place, cfc, row.ContentFinderCondition.RowId, row.TerritoryIntendedUse.RowId, label));
         }
     }
 
@@ -130,8 +147,26 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         }
         var opt = new ZoneLoadOptions { TerrainPreloadRadius = _terrainRadius, TerrainPreloadCenterXZ = TerrainCentreForLoad(territory) };
         _loadStatus = $"loading territory {territory} ({bg})...";
-        _loadedTerritory = territory;
-        _loadTask = ZoneCollisionLoader.LoadAsync(new LuminaZoneFileSource(Service.LuminaGameData), territory, bg, opt, _progress, _loadCts.Token);
+        _loadIsReload = _loadedTerritory == territory && _scene != null;
+        _loadingTerritory = territory;
+        _loadTask = ZoneCollisionLoader.LoadAsync(_fileSource, territory, bg, opt, _progress, _loadCts.Token);
+    }
+
+    // streams the terrain tiles within the terrain radius of xz; the tile count, the scene caches refreshed and any running recompute superseded when > 0
+    private int LoadTerrainAround(Vector2 xz)
+    {
+        if (_scene == null || _terrainRadius <= 0f)
+        {
+            return 0;
+        }
+        var added = ZoneCollisionLoader.EnsureTerrainLoaded(_scene, _fileSource, xz, _terrainRadius);
+        if (added > 0)
+        {
+            TerrainAppended();
+            ++_recomputeGen; // a recompute reading the old mesh list is discarded when it lands
+            MarkResultDirty();
+        }
+        return added;
     }
 
     // terrain tiles are lazy; preload around the player when loading the current zone, else around the previous centre, else none
@@ -150,9 +185,11 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
 
     private void PublishLoadedScene(ZoneCollisionScene scene)
     {
+        _loadedTerritory = scene.TerritoryId;
         _scene = scene;
         _picker = new(scene);
-        _session = new(scene);
+        InvalidateSceneCaches();
+        _session = new(scene, new LuminaZoneSheetSource());
         _selection = new(_session.Selected);
         _lastSelectionVersion = _selection.Version;
         _meshModes.Clear();
@@ -161,23 +198,57 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
             _meshModes.Add(MeshMode.Auto);
         }
         _pipeline.Reset();
+        _pendingProjectLoad = null;
+        ResetEditHistory();
+        _projectHealth.Clear();
         _hexSynced = false;
         _manualPolygons.Clear();
         _polygonDraft.Clear();
         _polygonDraftY.Clear();
+        _rules.Clear();
+        _selectedRule = -1;
+        _ruleSnippetFor = -1;
+        _timeline = null;
+        _timelinePath = "";
+        _timelineStatus = "";
+        _importedTimelines.Clear();
+        ResetReplayViewState();
+        _spawnClustersFor = -1;
+        _hoverObject = _selectedObject = _popupObject = ObjectRef.None;
+        EnsureDefaultScene();
         _session.DetectSeals();
-        var near = TerrainCentreForLoad(scene.TerritoryId);
-        var nearPoint = near is { } c ? new Vector3(c.X, 0f, c.Y) : (Vector3?)null;
-        _session.ChooseDefaultPair(nearPoint);
-        _session.EstimateCentre(nearPoint);
-        if (_session.LastEstimate.Reason == "no seals" && Service.ObjectTable.LocalPlayer is { } player && scene.TerritoryId == Service.ClientState.TerritoryType)
+        var inZone = scene.TerritoryId == Service.ClientState.TerritoryType;
+        var spawn = DungeonSpawn(_session.Model);
+        if (!inZone && !_loadIsReload && spawn is { } sp)
         {
-            _session.SetCentre(player.Position);
+            // a zone loaded from outside: start where the party starts (the entrance barrier, else the first player pop point)
+            LoadTerrainAround(new(sp.X, sp.Z));
+            var top = _picker.PickTriangleNearY(new(sp.X, sp.Z), sp.Y, _scratchHits);
+            _session.SetCentre(new(sp.X, top >= 0 ? scene.Triangles[top].YAt(sp.X, sp.Z) : sp.Y, sp.Z));
+            _session.ChooseDefaultPair(_session.Centre);
+        }
+        else
+        {
+            var near = TerrainCentreForLoad(scene.TerritoryId);
+            var nearPoint = near is { } c ? new Vector3(c.X, 0f, c.Y) : (Vector3?)null;
+            _session.ChooseDefaultPair(nearPoint);
+            _session.EstimateCentre(nearPoint);
+            if (_session.LastEstimate.Reason == "no seals" && Service.ObjectTable.LocalPlayer is { } player && inZone)
+            {
+                _session.SetCentre(player.Position);
+            }
         }
         _hoverTri = -1;
+        ResetCanvasState();
         _resultDirty = false;
+        var flowTiles = inZone ? 0 : PreloadTerrainAlongFlow(scene);
+        if (!_loadIsReload)
+        {
+            ReopenLastProject(scene);
+        }
+        RunPendingReplaySync();
         var r = scene.Report;
-        _loadStatus = $"territory {scene.TerritoryId}: {scene.Meshes.Count} meshes, {scene.Boxes.Count} boxes, {scene.Triangles.Count} triangles, {_session.Seals.Count} seal(s), parse {r.ParseMs} ms, transform {r.TransformMs} ms{(r.Warnings.Count > 0 ? $", {r.Warnings.Count} warning(s)" : "")}";
+        _loadStatus = $"territory {scene.TerritoryId}: {scene.Meshes.Count} meshes, {scene.Boxes.Count} boxes, {scene.Triangles.Count} triangles, {_session.Seals.Count} seal(s), parse {r.ParseMs} ms, transform {r.TransformMs} ms{(r.Warnings.Count > 0 ? $", {r.Warnings.Count} warning(s)" : "")}{(flowTiles > 0 ? $", {flowTiles} terrain tile(s) along the flow" : "")}";
         if (_fitOnLoad)
         {
             if (_session.CentreValid)
@@ -192,22 +263,61 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         }
     }
 
+    // where the party appears: the entrance barrier object, else the first player pop point of the layout
+    private static Vector3? DungeonSpawn(ZoneSceneModel model)
+    {
+        var entrance = model.EventObjects.Find(e => e.Role == ZoneObjectRole.Entrance);
+        if (entrance != null)
+        {
+            return entrance.ActorPosition;
+        }
+        var pop = model.PopPoints.Find(p => p.PopType == LgbPopType.Pc);
+        return pop?.Position;
+    }
+
     public override void Draw()
     {
         if (_loadTask != null && _loadTask.IsCompleted)
         {
-            if (_loadTask.IsCompletedSuccessfully)
+            var task = _loadTask;
+            _loadTask = null; // cleared first: a throw while publishing must not re-run every frame
+            if (task.IsCompletedSuccessfully)
             {
-                PublishLoadedScene(_loadTask.Result);
+                try
+                {
+                    PublishLoadedScene(task.Result);
+                }
+                catch (Exception ex)
+                {
+                    _loadStatus = $"territory {_loadingTerritory}: publish failed: {ex.Message}";
+                }
             }
             else
             {
-                _loadStatus = $"load failed: {_loadTask.Exception?.InnerException?.Message ?? _loadTask.Exception?.Message ?? "cancelled"}";
+                _loadStatus = $"territory {_loadingTerritory}: load {(task.IsCanceled ? "cancelled" : $"failed: {task.Exception?.InnerException?.Message ?? task.Exception?.Message}")}";
             }
-            _loadTask = null;
         }
+        PublishMapping();
+        if (MappingBusy)
+        {
+            DrawMappingProgress();
+            return;
+        }
+        PublishAutoMap();
         PublishRecompute();
+        PublishTimeline();
+        if (_seekPending && Environment.TickCount64 - _seekPendingSince >= 100)
+        {
+            FlushPendingSeek(); // the slider's own timer only runs while the Scenes section is drawn
+        }
+        PullViewerTime();
+        _session?.EnsureResolved();
         UpdateResultDirty();
+        TrackEdits();
+        if (_autosaveDue && !_resultDirty && _recomputeTask == null && AutosaveTick())
+        {
+            _autosaveDue = false;
+        }
         HandleKeyboard();
         DrawWorldPreview();
 
@@ -228,38 +338,42 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
             }
         }
         ImGui.TableNextColumn();
+        DrawCanvasToolbar();
         DrawCanvas(ImGui.GetContentRegionAvail());
     }
 
     // the game consumes keyboard input before ImGui sees it, so shortcuts poll the raw key state (same approach as the live picker)
     private const int VkBackspace = 0x08, VkTab = 0x09, VkEnter = 0x0D, VkShift = 0x10, VkControl = 0x11, VkMenu = 0x12, VkEscape = 0x1B, VkSpace = 0x20, VkDelete = 0x2E;
-    private const int Vk1 = 0x31, VkB = 0x42, VkC = 0x43, VkF = 0x46, VkG = 0x47, VkI = 0x49, VkV = 0x56, VkX = 0x58, VkY = 0x59, VkZ = 0x5A;
+    private const int Vk1 = 0x31, VkB = 0x42, VkC = 0x43, VkE = 0x45, VkF = 0x46, VkG = 0x47, VkI = 0x49, VkV = 0x56, VkX = 0x58, VkY = 0x59, VkZ = 0x5A;
+    private const int VkLeft = 0x25, VkRight = 0x27;
 
-    private static bool RawKeyDown(int vk) => (PInvoke.User32.GetAsyncKeyState(vk) & 0x8000) != 0;
+    private static partial class Native
+    {
+        [LibraryImport("user32.dll")]
+        internal static partial short GetAsyncKeyState(int vKey);
+    }
+
+    private static bool RawKeyDown(int vk) => (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
+
+    private static readonly int[] PolledKeys = [VkBackspace, VkTab, VkEnter, VkEscape, VkDelete, Vk1, Vk1 + 1, Vk1 + 2, Vk1 + 3, Vk1 + 4, Vk1 + 5, VkB, VkC, VkE, VkF, VkG, VkI, VkV, VkX, VkY, VkZ, VkLeft, VkRight];
 
     private void PollKeys()
     {
-        _keyPressedThisFrame.Clear();
+        Array.Clear(_keyPressedThisFrame);
         // edge-detect every frame so a stale edge cannot fire when the window regains focus
-        foreach (var vk in (ReadOnlySpan<int>)[VkBackspace, VkTab, VkEnter, VkEscape, VkDelete, Vk1, Vk1 + 1, Vk1 + 2, Vk1 + 3, Vk1 + 4, Vk1 + 5, VkB, VkC, VkF, VkG, VkI, VkV, VkX, VkY, VkZ])
+        foreach (var vk in PolledKeys)
         {
             var down = RawKeyDown(vk);
-            if (down && !_keyWasDown.GetValueOrDefault(vk))
-            {
-                _keyPressedThisFrame.Add(vk);
-            }
+            _keyPressedThisFrame[vk] = down && !_keyWasDown[vk];
             _keyWasDown[vk] = down;
         }
         _canvas.SpaceHeld = RawKeyDown(VkSpace);
+        _canvas.ShiftHeld = RawKeyDown(VkShift);
         // shortcuts act only while this window (or its children) is focused and no text field is being edited
         _keysActive = ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) && !ImGui.GetIO().WantTextInput;
-        if (!_keysActive)
-        {
-            _keyPressedThisFrame.Clear();
-        }
     }
 
-    private bool KeyPressed(int vk) => _keysActive && _keyPressedThisFrame.Contains(vk);
+    private bool KeyPressed(int vk) => _keysActive && _keyPressedThisFrame[vk];
     private static bool CtrlHeld => RawKeyDown(VkControl) || ImGui.GetIO().KeyCtrl;
     private static bool ShiftHeld => RawKeyDown(VkShift) || ImGui.GetIO().KeyShift;
     private static bool AltHeld => RawKeyDown(VkMenu) || ImGui.GetIO().KeyAlt;
@@ -275,13 +389,38 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         {
             ImGui.SetNextFrameWantCaptureKeyboard(true);
         }
-        if (CtrlHeld && KeyPressed(VkZ))
+        var ctrl = CtrlHeld;
+        if (ctrl && ShiftHeld && KeyPressed(VkZ))
+        {
+            UndoEdit();
+        }
+        else if (ctrl && KeyPressed(VkZ))
         {
             _selection.Undo();
         }
-        else if (CtrlHeld && KeyPressed(VkY))
+        else if (ctrl && KeyPressed(VkY))
         {
             _selection.Redo();
+        }
+        else if (ctrl && KeyPressed(VkLeft))
+        {
+            StepTimeline(-1);
+        }
+        else if (ctrl && KeyPressed(VkRight))
+        {
+            StepTimeline(1);
+        }
+        else if (ctrl || AltHeld)
+        {
+            return; // the plain-letter shortcuts below do not fire while a modifier is held (ctrl+C in a text field, alt+click on the canvas)
+        }
+        else if (KeyPressed(VkE) && _selectedObject.Kind == ObjectKind.EObj && _session != null)
+        {
+            var eo = _session.Model.EventObjects[_selectedObject.Index];
+            if (eo.ControlsCollision)
+            {
+                ShowEObjDerived(_selectedObject.Index, _session.EObjState(_selectedObject.Index) == 7 ? (ushort)0 : (ushort)7);
+            }
         }
         else if (KeyPressed(VkF) && _scene != null)
         {
@@ -329,11 +468,11 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         }
         else if (KeyPressed(VkX))
         {
-            ToggleExcludeAnchorMesh();
+            ToggleAnchorMeshMode(MeshMode.Exclude);
         }
         else if (KeyPressed(VkI))
         {
-            ToggleFloorAnchorMesh();
+            ToggleAnchorMeshMode(MeshMode.Include);
         }
         else if (KeyPressed(VkB))
         {
@@ -386,24 +525,15 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
             : $"new({CollisionArenaCodeGen.F(_anchorVertex.X, 3)}, {CollisionArenaCodeGen.F(_anchorVertex.Z, 3)})");
     }
 
-    private void ToggleExcludeAnchorMesh()
+    // the last clicked triangle's mesh switched into `mode`, or back to Auto when it is in that mode already
+    private void ToggleAnchorMeshMode(MeshMode mode)
     {
         if (_scene == null || _anchorTri < 0)
         {
             return;
         }
         var m = _scene.Triangles[_anchorTri].MeshIndex;
-        SetMeshMode(m, _meshModes[m] == MeshMode.Exclude ? MeshMode.Auto : MeshMode.Exclude);
-    }
-
-    private void ToggleFloorAnchorMesh()
-    {
-        if (_scene == null || _anchorTri < 0)
-        {
-            return;
-        }
-        var m = _scene.Triangles[_anchorTri].MeshIndex;
-        SetMeshMode(m, _meshModes[m] == MeshMode.Include ? MeshMode.Auto : MeshMode.Include);
+        SetMeshMode(m, _meshModes[m] == mode ? MeshMode.Auto : mode);
     }
 
     // Include = the mesh counts as floor whatever its material: its walkable-slope triangles are selected, become flood-fill candidates and never cut
@@ -475,12 +605,14 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
 
     // --- result recompute: selection -> polygons on a task, then the pipeline on the main thread ---
 
+    // every edit restarts the delay, so a burst of edits triggers one recompute after the last one
     private void MarkResultDirty()
     {
-        if (!_resultDirty)
+        _resultDirty = true;
+        _resultDirtySince = Environment.TickCount64;
+        if (_recomputeTask != null)
         {
-            _resultDirty = true;
-            _resultDirtySince = Environment.TickCount64;
+            _recomputeCts?.Cancel(); // the run in flight is stale: stop it so the next one starts sooner
         }
     }
 
@@ -491,13 +623,77 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
             _lastSelectionVersion = _selection.Version;
             MarkResultDirty();
         }
-        if (_resultDirty && _autoRecompute && _recomputeTask == null && Environment.TickCount64 - _resultDirtySince >= 250)
+        if (_resultDirty && _autoRecompute && _recomputeTask == null && Environment.TickCount64 - _resultDirtySince >= (long)(_autoRecomputeDelay * 1000f))
         {
             StartRecompute();
         }
-        if (_pipeline.CurrentSimplify != _pipeline.LastSimplify && _pipeline.Raw.Count > 0)
+        // simplify sliders rebuild once the value has rested for a moment, not on every frame of a drag
+        var simplify = _pipeline.CurrentSimplify;
+        if (simplify != _pipeline.LastSimplify && _pipeline.Raw.Count > 0)
         {
-            _pipeline.RebuildSimplified();
+            if (simplify != _pendingSimplify)
+            {
+                _pendingSimplify = simplify;
+                _pendingSimplifySince = Environment.TickCount64;
+            }
+            else if (Environment.TickCount64 - _pendingSimplifySince >= 150)
+            {
+                _pipeline.RebuildSimplified();
+            }
+        }
+    }
+
+    // --- auto-map: adjacency + flood fill on a task, published on the main thread ---
+
+    private void StartAutoMap()
+    {
+        if (_session == null || _autoMapTask != null)
+        {
+            return;
+        }
+        var session = _session;
+        var job = session.PrepareAutoMap();
+        _autoMapCts?.Dispose();
+        _autoMapCts = new();
+        var ct = _autoMapCts.Token;
+        _autoMapTask = Task.Run(() =>
+        {
+            session.RunAutoMap(job, ct);
+            return job;
+        });
+    }
+
+    private void PublishAutoMap()
+    {
+        if (_autoMapTask == null || !_autoMapTask.IsCompleted)
+        {
+            return;
+        }
+        var task = _autoMapTask;
+        _autoMapTask = null;
+        if (!task.IsCompletedSuccessfully || _session == null)
+        {
+            _loadStatus = $"auto-map {(task.IsCanceled || task.Exception?.InnerException is OperationCanceledException ? "cancelled" : $"failed: {task.Exception?.InnerException?.Message ?? task.Exception?.Message}")}";
+            if (_pendingProjectLoad is { } dropped)
+            {
+                _pendingProjectLoad = null; // the project load waiting on this result is abandoned, not finished by a later manual auto-map
+                _projectStatus = $"loading '{dropped.name}' failed: {_loadStatus}";
+            }
+            return;
+        }
+        HashSet<int> previous = [.. _selection.Selected]; // before the apply: it rewrites the selection in place
+        if (!_session.ApplyAutoMap(task.Result))
+        {
+            StartAutoMap(); // the inputs changed while it ran: once more with the current ones
+            return;
+        }
+        _selection.RecordExternal(previous, "auto-map");
+        MarkResultDirty();
+        _resultDirtySince = 0;
+        if (_pendingProjectLoad is { } pending)
+        {
+            _pendingProjectLoad = null;
+            FinishProjectLoad(pending.p, pending.name, pending.missing, pending.missingSceneRefs);
         }
     }
 
@@ -519,8 +715,8 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         var settings = session.Settings.Clone();
         var centre = session.Centre;
         var keep = settings.KeepPolygonContainingCentre ? new Vector2(centre.X, centre.Z) : (Vector2?)null;
-        var extraUnion = ManualUnionPaths();
-        var extraCut = ManualCutPaths();
+        var extraUnion = ManualPaths(false);
+        var extraCut = ManualPaths(true);
         var extraY = ManualYSource();
         HashSet<int> excluded = [];
         for (var m = 0; m < _meshModes.Count; ++m)
@@ -534,10 +730,13 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         HashSet<int> ignoredBoxes = [.. session.IgnoredBoxes];
         var gen = ++_recomputeGen;
         _recomputeTaskGen = gen;
+        _recomputeCts?.Dispose();
+        _recomputeCts = new();
+        var ct = _recomputeCts.Token;
         _recomputeTask = Task.Run(() =>
         {
             HashSet<int> rim = [];
-            var polys = ArenaAutoMapper.BuildPolygons(scene, snapshot, boxes, seals, active, extraUnion, extraCut, extraY, keep, settings, out var keepStatus, out var ms, out var obstacles, out var obstacleBoxes, out var wallSnapEdges, rim, excluded, floorMeshes, ignoredBoxes);
+            var polys = ArenaAutoMapper.BuildPolygons(scene, snapshot, boxes, seals, active, extraUnion, extraCut, extraY, keep, settings, out var keepStatus, out var ms, out var obstacles, out var obstacleBoxes, out var wallSnapEdges, rim, excluded, floorMeshes, ignoredBoxes, ct: ct);
             return (polys, keepStatus, ms, obstacles, obstacleBoxes, wallSnapEdges, rim);
         });
     }
@@ -554,6 +753,10 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         {
             MarkResultDirty(); // superseded, run again with the latest state
             return;
+        }
+        if (task.IsCanceled || task.Exception?.InnerException is OperationCanceledException)
+        {
+            return; // stopped by a newer dirty mark, which already queued the next run
         }
         if (!task.IsCompletedSuccessfully)
         {
@@ -580,5 +783,7 @@ public sealed partial class ZoneArenaEditorWindow : UIWindow
         {
             _session.Polygons = polys;
         }
+        _lastAutosave = Environment.TickCount64 - 2000; // AutosaveTick waits 5 s since the last save: the autosave lands three seconds after the result settles
+        _autosaveDue = true;
     }
 }

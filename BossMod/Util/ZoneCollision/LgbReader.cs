@@ -6,6 +6,9 @@ public enum LgbInstanceType : int
 {
     BgPart = 1,
     SharedGroup = 6,
+    EventNpc = 8,
+    BattleNpc = 9,
+    Treasure = 16,
     PopRange = 40,
     ExitRange = 41,
     MapRange = 43,
@@ -18,8 +21,20 @@ public enum LgbInstanceType : int
 public enum LgbBgCollisionType : int { None = 0, Mesh = 1, Analytic = 2 }
 public enum LgbColliderKind : byte { None = 0, Box = 1, Sphere = 2, Cylinder = 3, Plane = 4, Mesh = 5, PlaneTwoSided = 6 }
 public enum LgbAnalyticKind : byte { None = 0, Box = 1, Sphere = 2, Cylinder = 3, Plane = 4 }
+public enum LgbPopType : int { None = 0, Pc = 1, Npc = 2, Content = 3 }
+public enum LgbDoorState : int { None = 0, Auto = 1, Open = 2, Closed = 3 }
+public enum LgbTriggerShape : int { None = 0, Box = 1, Sphere = 2, Cylinder = 3, Board = 4, Mesh = 5, BoardBothSides = 6 }
 
 public readonly record struct LgbAnalytic(ulong MatMask, ulong MatValue, LgbAnalyticKind Kind, Vector3 Translation, Vector3 RotationEuler, Vector3 Scale, Bounds3 Bounds);
+// per-type payloads that the scene/scripting layer needs; every instance keeps the flat fields below for the collision path
+public readonly record struct LgbTriggerBox(LgbTriggerShape Shape, short Priority, bool Enabled);
+public readonly record struct LgbExitRange(int ExitType, ushort ZoneId, ushort TerritoryType, int Index, uint DestInstanceId, uint ReturnInstanceId, float PlayerRunningDirection);
+public readonly record struct LgbMapRange(uint Map, uint PlaceNameBlock, uint PlaceNameSpot, uint Weather, uint Bgm, bool MapEnabled, bool PlaceNameEnabled);
+public readonly record struct LgbPopRange(LgbPopType PopType, float InnerRadiusRatio, byte Index, Vector3[] RelativePositions);
+public readonly record struct LgbSharedGroup(LgbDoorState InitialDoorState, int InitialRotationState, bool RandomTimelineAutoPlay, bool RandomTimelineLoop, bool IsCollisionControllableWithoutEObj, uint BoundClientPathInstanceId, bool NotCreateNavimeshDoor, int InitialTransformState, int InitialColorState);
+public readonly record struct LgbNpc(uint BaseId, uint PopWeather, byte PopTimeStart, byte PopTimeEnd, uint MoveAi, byte WanderingRange, byte Route, ushort EventGroup, uint Behavior);
+public readonly record struct LgbTreasure(uint BaseId, bool NonpopInitZone);
+public readonly record struct LgbObSetRef(int AssetType, uint InstanceKey, bool Enable, bool EmissiveEnable);
 
 public sealed class LgbInstance
 {
@@ -40,13 +55,30 @@ public sealed class LgbInstance
     public string? BoxMeshPath;
     // shared group
     public string? SharedGroupPath;
+    public uint BaseId;           // EventObject: EObj sheet row (= the actor OID in game); PopRange: pop type; npc/treasure: base row
+    public uint BoundInstanceId;  // EventObject: layout instance bound to this object
+    public uint LinkedInstanceId;
+    // typed payloads (null when the type has none or the read failed)
+    public LgbTriggerBox? Trigger;
+    public LgbExitRange? Exit;
+    public LgbMapRange? Map;
+    public LgbPopRange? Pop;
+    public LgbSharedGroup? Group;
+    public LgbNpc? Npc;
+    public LgbTreasure? Treasure;
 }
 
 public sealed class LgbLayer
 {
+    public uint LayerId;          // full 32-bit id (shared-group layers use the high word); Key is the low 16 bits
     public ushort Key;
     public string Name = "";
     public ushort FestivalId, FestivalPhase;
+    public bool ToolModeVisible = true, IsTemporary, IsHousing;
+    public ushort VersionMask;
+    public int LayerSetReferencedType;
+    public uint[] LayerSetIds = [];
+    public LgbObSetRef[] ObSetEnable = [];
     public int FileOffset;
     public readonly List<LgbInstance> Instances = [];
 }
@@ -159,7 +191,7 @@ public static class LgbReader
 
     private static LgbLayer ParseLayer(ReadOnlySpan<byte> data, int l, LgbDocument doc)
     {
-        var layer = new LgbLayer { FileOffset = l, Key = ZoneBinary.U16(data, l) };
+        var layer = new LgbLayer { FileOffset = l, LayerId = ZoneBinary.U32(data, l), Key = ZoneBinary.U16(data, l) };
         var offsetName = ZoneBinary.I32(data, l + 4);
         var offsetInstances = ZoneBinary.I32(data, l + 8);
         var numInstances = ZoneBinary.I32(data, l + 0xc);
@@ -170,13 +202,21 @@ public static class LgbReader
         {
             throw new ZoneFormatException($"layer '{layer.Name}' at 0x{l:X}: implausible instance count {numInstances}");
         }
+        try
+        {
+            ParseLayerExtras(data, l, layer);
+        }
+        catch (ZoneFormatException ex)
+        {
+            doc.Warnings.Add($"layer '{layer.Name}' at 0x{l:X}: header extras skipped ({ex.Message})");
+        }
         var table = l + offsetInstances;
         for (var i = 0; i < numInstances; ++i)
         {
             var inst = table + ZoneBinary.I32(data, table + 4 * i);
             try
             {
-                layer.Instances.Add(ParseInstance(data, inst));
+                layer.Instances.Add(ParseInstance(data, inst, doc));
             }
             catch (ZoneFormatException ex)
             {
@@ -186,7 +226,44 @@ public static class LgbReader
         return layer;
     }
 
-    private static LgbInstance ParseInstance(ReadOnlySpan<byte> data, int i)
+    // LayerHeader: flags @0x10, LayerSetReferencedList offset @0x14 (list {type, offset rel. to list, count}), festival @0x18, IsTemporary @0x1c,
+    // IsHousing @0x1d, VersionMask @0x1e, OBSetReferencedList @0x24/0x28, OBSetEnableReferencedList @0x2c/0x30 (12-byte entries)
+    private static void ParseLayerExtras(ReadOnlySpan<byte> data, int l, LgbLayer layer)
+    {
+        layer.ToolModeVisible = ZoneBinary.U8(data, l + 0x10) != 0;
+        layer.IsTemporary = ZoneBinary.U8(data, l + 0x1c) != 0;
+        layer.IsHousing = ZoneBinary.U8(data, l + 0x1d) != 0;
+        layer.VersionMask = ZoneBinary.U16(data, l + 0x1e);
+        var setList = ZoneBinary.I32(data, l + 0x14);
+        if (setList > 0)
+        {
+            var s = l + setList;
+            layer.LayerSetReferencedType = ZoneBinary.I32(data, s);
+            var off = ZoneBinary.I32(data, s + 4);
+            var count = ZoneBinary.I32(data, s + 8);
+            if (count > 0 && count <= 256)
+            {
+                layer.LayerSetIds = new uint[count];
+                for (var i = 0; i < count; ++i)
+                {
+                    layer.LayerSetIds[i] = ZoneBinary.U32(data, s + off + 4 * i);
+                }
+            }
+        }
+        var obOff = ZoneBinary.I32(data, l + 0x2c);
+        var obCount = ZoneBinary.I32(data, l + 0x30);
+        if (obOff > 0 && obCount > 0 && obCount <= 4096)
+        {
+            layer.ObSetEnable = new LgbObSetRef[obCount];
+            for (var i = 0; i < obCount; ++i)
+            {
+                var e = l + obOff + 12 * i;
+                layer.ObSetEnable[i] = new(ZoneBinary.I32(data, e), ZoneBinary.U32(data, e + 4), ZoneBinary.U8(data, e + 8) != 0, ZoneBinary.U8(data, e + 9) != 0);
+            }
+        }
+    }
+
+    private static LgbInstance ParseInstance(ReadOnlySpan<byte> data, int i, LgbDocument doc)
     {
         var inst = new LgbInstance
         {
@@ -221,8 +298,8 @@ public static class LgbReader
                 break;
             case LgbInstanceType.CollisionBox:
                 {
-                    inst.ColliderKind = (LgbColliderKind)data[i + 0x30];
-                    inst.ActiveByDefault = data[i + 0x36] != 0;
+                    inst.ColliderKind = (LgbColliderKind)ZoneBinary.U8(data, i + 0x30);
+                    inst.ActiveByDefault = ZoneBinary.U8(data, i + 0x36) != 0;
                     inst.BoxMatMask = ZoneBinary.U32(data, i + 0x3c) | ((ulong)ZoneBinary.U32(data, i + 0x44) << 32);
                     inst.BoxMatValue = ZoneBinary.U32(data, i + 0x40) | ((ulong)ZoneBinary.U32(data, i + 0x48) << 32);
                     var path = ZoneBinary.I32(data, i + 0x50);
@@ -239,10 +316,79 @@ public static class LgbReader
             case LgbInstanceType.EventRange:
             case LgbInstanceType.MapRange:
             case LgbInstanceType.DoorRange:
-                inst.ColliderKind = (LgbColliderKind)data[i + 0x30];
-                inst.ActiveByDefault = data[i + 0x36] != 0;
+                inst.ColliderKind = (LgbColliderKind)ZoneBinary.U8(data, i + 0x30);
+                inst.ActiveByDefault = ZoneBinary.U8(data, i + 0x36) != 0;
                 break;
+            case LgbInstanceType.EventObject:
+                // GameInstanceObject { BaseId @0x30 } (the EObj sheet row = the actor's OID in game), then BoundInstanceID @0x34, LinkedInstanceID @0x38
+                inst.BaseId = ZoneBinary.U32(data, i + 0x30);
+                inst.BoundInstanceId = ZoneBinary.U32(data, i + 0x34);
+                inst.LinkedInstanceId = ZoneBinary.U32(data, i + 0x38);
+                break;
+            case LgbInstanceType.PopRange:
+            case LgbInstanceType.EventNpc:
+            case LgbInstanceType.BattleNpc:
+            case LgbInstanceType.Treasure:
+                inst.BaseId = ZoneBinary.U32(data, i + 0x30); // PopType / ENpcBase / BNpcBase / treasure base
+                break;
+        }
+        try
+        {
+            ParsePayload(data, i, inst);
+        }
+        catch (ZoneFormatException ex)
+        {
+            doc.Warnings.Add($"instance '{inst.Name}' type {inst.Type} at 0x{i:X}: payload skipped ({ex.Message})");
         }
         return inst;
     }
+
+    // typed payloads, offsets from the instance start (the common header is 0x30 bytes); the harness `zone --oracle` pins them against Lumina
+    private static void ParsePayload(ReadOnlySpan<byte> data, int i, LgbInstance inst)
+    {
+        switch ((LgbInstanceType)inst.Type)
+        {
+            case LgbInstanceType.ExitRange:
+                inst.Trigger = ReadTrigger(data, i);
+                inst.Exit = new(ZoneBinary.I32(data, i + 0x3c), ZoneBinary.U16(data, i + 0x40), ZoneBinary.U16(data, i + 0x42), ZoneBinary.I32(data, i + 0x44), ZoneBinary.U32(data, i + 0x48), ZoneBinary.U32(data, i + 0x4c), ZoneBinary.F32(data, i + 0x50));
+                break;
+            case LgbInstanceType.MapRange:
+                inst.Trigger = ReadTrigger(data, i);
+                inst.Map = new(ZoneBinary.U32(data, i + 0x3c), ZoneBinary.U32(data, i + 0x40), ZoneBinary.U32(data, i + 0x44), ZoneBinary.U32(data, i + 0x48), ZoneBinary.U32(data, i + 0x4c), ZoneBinary.U8(data, i + 0x5d) != 0, ZoneBinary.U8(data, i + 0x5e) != 0);
+                break;
+            case LgbInstanceType.EventRange:
+            case LgbInstanceType.DoorRange:
+                inst.Trigger = ReadTrigger(data, i);
+                break;
+            case LgbInstanceType.PopRange:
+                {
+                    var listOff = ZoneBinary.I32(data, i + 0x34);
+                    var count = ZoneBinary.I32(data, i + 0x38);
+                    var rel = Array.Empty<Vector3>();
+                    if (listOff > 0 && count > 0 && count <= 64)
+                    {
+                        rel = new Vector3[count];
+                        for (var k = 0; k < count; ++k)
+                        {
+                            rel[k] = ZoneBinary.Vec3(data, i + 0x30 + listOff + 12 * k);
+                        }
+                    }
+                    inst.Pop = new((LgbPopType)ZoneBinary.I32(data, i + 0x30), ZoneBinary.F32(data, i + 0x3c), ZoneBinary.U8(data, i + 0x40), rel);
+                }
+                break;
+            case LgbInstanceType.SharedGroup:
+                inst.Group = new((LgbDoorState)ZoneBinary.I32(data, i + 0x34), ZoneBinary.I32(data, i + 0x40), ZoneBinary.U8(data, i + 0x44) != 0, ZoneBinary.U8(data, i + 0x45) != 0, ZoneBinary.U8(data, i + 0x46) != 0, ZoneBinary.U32(data, i + 0x48), ZoneBinary.U8(data, i + 0x50) != 0, ZoneBinary.I32(data, i + 0x54), ZoneBinary.I32(data, i + 0x58));
+                break;
+            case LgbInstanceType.EventNpc:
+            case LgbInstanceType.BattleNpc:
+                inst.Npc = new(ZoneBinary.U32(data, i + 0x30), ZoneBinary.U32(data, i + 0x34), ZoneBinary.U8(data, i + 0x38), ZoneBinary.U8(data, i + 0x39), ZoneBinary.U32(data, i + 0x3c), ZoneBinary.U8(data, i + 0x40), ZoneBinary.U8(data, i + 0x41), ZoneBinary.U16(data, i + 0x42), ZoneBinary.U32(data, i + 0x4c));
+                break;
+            case LgbInstanceType.Treasure:
+                inst.Treasure = new(ZoneBinary.U32(data, i + 0x30), ZoneBinary.U8(data, i + 0x34) != 0);
+                break;
+        }
+    }
+
+    // TriggerBoxInstanceObject { shape i32 @0x30, priority i16 @0x34, enabled u8 @0x36 }
+    private static LgbTriggerBox ReadTrigger(ReadOnlySpan<byte> data, int i) => new((LgbTriggerShape)ZoneBinary.I32(data, i + 0x30), (short)ZoneBinary.U16(data, i + 0x34), ZoneBinary.U8(data, i + 0x36) != 0);
 }

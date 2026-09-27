@@ -42,54 +42,45 @@ public static class PcbReader
         }
         mesh.HeaderNodes = (int)ZoneBinary.U32(data, 8);
         mesh.HeaderPolygons = (int)ZoneBinary.U32(data, 0xc);
+        // the header count excludes the root for single-node files (0), so the walk may see one node more; every node needs its own header bytes
+        if (mesh.HeaderNodes < 0 || mesh.HeaderNodes > (data.Length - HeaderSize) / NodeHeaderSize)
+        {
+            throw new ZoneFormatException($"{path}: implausible node count {mesh.HeaderNodes} for {data.Length} bytes");
+        }
+        var maxNodes = mesh.HeaderNodes + 1;
 
-        List<Vector3> verts = new(Math.Max(16, mesh.HeaderPolygons * 2));
-        List<int> indices = new(Math.Max(48, mesh.HeaderPolygons * 3));
-        List<ulong> materials = new(Math.Max(16, mesh.HeaderPolygons));
+        // first pass: the node tree (depth-first, child 1 before child 2) and the totals to size the arrays
+        var nodes = new List<PcbNodeHeader>(maxNodes);
+        var seen = new HashSet<int>();
         var stack = new Stack<int>();
         stack.Push(HeaderSize);
-        var visited = 0;
-        var maxNodes = Math.Max(mesh.HeaderNodes * 2 + 16, 1 << 16);
-        Bounds3? bounds = null;
+        var vertTotal = 0;
+        var primTotal = 0;
         var childCheckFailures = 0;
+        var bounds = Bounds3.Empty;
         while (stack.Count > 0)
         {
             var n = stack.Pop();
-            if (++visited > maxNodes)
+            if (!seen.Add(n))
             {
-                throw new ZoneFormatException($"{path}: node walk exceeded {maxNodes} nodes (corrupt child offsets?)");
+                throw new ZoneFormatException($"{path}: node at 0x{n:X} reached twice (child offset cycle)");
+            }
+            if (nodes.Count >= maxNodes)
+            {
+                throw new ZoneFormatException($"{path}: node walk exceeded the header count {mesh.HeaderNodes} (corrupt child offsets?)");
             }
             var h = ReadNodeHeader(data, n);
-            bounds = bounds == null ? h.Bounds : Bounds3.Union(bounds.Value, h.Bounds);
-            var vertBase = verts.Count;
-            var p = n + NodeHeaderSize;
-            for (var i = 0; i < h.VertsRaw; ++i)
+            nodes.Add(h);
+            bounds = Bounds3.Union(bounds, h.Bounds);
+            vertTotal += h.VertsRaw + h.VertsCompressed;
+            primTotal += h.Prims;
+            var end = n + NodeHeaderSize + h.VertsRaw * 12 + h.VertsCompressed * 6 + h.Prims * PrimSize;
+            if (end > data.Length)
             {
-                verts.Add(ZoneBinary.Vec3(data, p));
-                p += 12;
-            }
-            var scale = h.Bounds.Size / 65535f;
-            for (var i = 0; i < h.VertsCompressed; ++i)
-            {
-                verts.Add(new(h.Bounds.Min.X + ZoneBinary.U16(data, p) * scale.X, h.Bounds.Min.Y + ZoneBinary.U16(data, p + 2) * scale.Y, h.Bounds.Min.Z + ZoneBinary.U16(data, p + 4) * scale.Z));
-                p += 6;
-            }
-            var vertCount = h.VertsRaw + h.VertsCompressed;
-            for (var i = 0; i < h.Prims; ++i)
-            {
-                int v1 = data[p], v2 = data[p + 1], v3 = data[p + 2];
-                if (v1 >= vertCount || v2 >= vertCount || v3 >= vertCount)
-                {
-                    throw new ZoneFormatException($"{path}: node at 0x{n:X} primitive {i} references vertex beyond {vertCount}");
-                }
-                indices.Add(vertBase + v1);
-                indices.Add(vertBase + v2);
-                indices.Add(vertBase + v3);
-                materials.Add(ZoneBinary.U64(data, p + 4));
-                p += PrimSize;
+                throw new ZoneFormatException($"{path}: node at 0x{n:X} payload ends at 0x{end:X} outside file of {data.Length} bytes");
             }
             // a node's first child is expected to start right after its own payload
-            if (h.Child1Offset != 0 && n + h.Child1Offset != p)
+            if (h.Child1Offset != 0 && n + h.Child1Offset != end)
             {
                 ++childCheckFailures;
             }
@@ -102,14 +93,53 @@ public static class PcbReader
                 stack.Push(n + h.Child1Offset);
             }
         }
-        mesh.Vertices = [.. verts];
-        mesh.Indices = [.. indices];
-        mesh.Materials = [.. materials];
-        mesh.NodeCount = visited;
-        mesh.LocalBounds = bounds ?? default;
-        // the header node count excludes the root for single-node files (0); accept either convention until the validator pins it
-        mesh.SelfCheckOk = (visited == mesh.HeaderNodes || visited == mesh.HeaderNodes + 1) && materials.Count == mesh.HeaderPolygons && childCheckFailures == 0;
-        mesh.SelfCheck = $"nodes {visited}/{mesh.HeaderNodes}, prims {materials.Count}/{mesh.HeaderPolygons}, child-offset mismatches {childCheckFailures}";
+
+        // second pass: decode straight into the arrays
+        var verts = new Vector3[vertTotal];
+        var indices = new int[primTotal * 3];
+        var materials = new ulong[primTotal];
+        var vi = 0;
+        var pi = 0;
+        for (var k = 0; k < nodes.Count; ++k)
+        {
+            var h = nodes[k];
+            var n = h.Offset;
+            var vertBase = vi;
+            var p = n + NodeHeaderSize;
+            for (var i = 0; i < h.VertsRaw; ++i)
+            {
+                verts[vi++] = ZoneBinary.Vec3(data, p);
+                p += 12;
+            }
+            var scale = h.Bounds.Size / 65535f;
+            for (var i = 0; i < h.VertsCompressed; ++i)
+            {
+                verts[vi++] = new(h.Bounds.Min.X + ZoneBinary.U16(data, p) * scale.X, h.Bounds.Min.Y + ZoneBinary.U16(data, p + 2) * scale.Y, h.Bounds.Min.Z + ZoneBinary.U16(data, p + 4) * scale.Z);
+                p += 6;
+            }
+            var vertCount = h.VertsRaw + h.VertsCompressed;
+            for (var i = 0; i < h.Prims; ++i)
+            {
+                int v1 = ZoneBinary.U8(data, p), v2 = ZoneBinary.U8(data, p + 1), v3 = ZoneBinary.U8(data, p + 2);
+                if (v1 >= vertCount || v2 >= vertCount || v3 >= vertCount)
+                {
+                    throw new ZoneFormatException($"{path}: node at 0x{n:X} primitive {i} references vertex beyond {vertCount}");
+                }
+                indices[3 * pi] = vertBase + v1;
+                indices[3 * pi + 1] = vertBase + v2;
+                indices[3 * pi + 2] = vertBase + v3;
+                materials[pi++] = ZoneBinary.U64(data, p + 4);
+                p += PrimSize;
+            }
+        }
+        mesh.Vertices = verts;
+        mesh.Indices = indices;
+        mesh.Materials = materials;
+        mesh.NodeCount = nodes.Count;
+        mesh.LocalBounds = nodes.Count > 0 ? bounds : default;
+        // the header node count excludes the root for single-node files (0); both conventions are accepted
+        mesh.SelfCheckOk = (nodes.Count == mesh.HeaderNodes || nodes.Count == mesh.HeaderNodes + 1) && primTotal == mesh.HeaderPolygons && childCheckFailures == 0;
+        mesh.SelfCheck = $"nodes {nodes.Count}/{mesh.HeaderNodes}, prims {primTotal}/{mesh.HeaderPolygons}, child-offset mismatches {childCheckFailures}";
         return mesh;
     }
 

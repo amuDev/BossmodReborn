@@ -7,91 +7,15 @@ namespace BossMod;
 
 public sealed partial class ZoneArenaEditorWindow
 {
-    public sealed class SavedSeal
-    {
-        public string LayoutId = "";
-        public bool Use = true;
-    }
-
-    public sealed class SavedMeshMode
-    {
-        public string Path = "";
-        public string LayoutId = "";
-        public string Mode = "Auto";
-    }
-
-    public sealed class SavedTriangleDelta
-    {
-        public string Path = "";
-        public string LayoutId = "";
-        public int TriangleCount;
-        public int[] Tris = []; // mesh-local indices
-    }
-
-    public sealed class SavedManualPolygon
-    {
-        public bool Difference = true;
-        public float[] XZ = [];
-        public float[] Y = [];
-    }
-
-    public sealed class ZoneArenaProject
-    {
-        public float CenterX, CenterY, CenterZ;
-        public bool CentreValid;
-        public List<string> FloorMaterials = ["7000/F000"];
-        public string SealMaterialValue = "2400", SealMaterialMask = "1FFFFFFFFF";
-        public bool SealGeometryFilter = true;
-        public string PairSealA = "", PairSealB = "", PairMarker = "";
-        public List<string> FloorBoxes = [];
-        public List<string> IgnoredBoxes = [];
-        public List<string> ObstacleBoxMaterials = ["2000/F000"];
-        public bool CutBoxes = true;
-        public int FloorMatchMode;
-        public bool SealRequireExactMask = true, SealIncludeInactive = true;
-        public float SealPairMaxDistance = 80f, MaxRadius = 60f, MaxSlopeDeg = 45f, WeldEps = 1e-3f, SealFootprintInflate = 0.05f, ObstacleInflate = 0.05f, ObstacleHeightAbove = 2.5f, ObstacleHeightBelow = 0.5f, ObstacleMinHeight = 0.25f;
-        public int Adjacency, SealBlock;
-        public bool KeepPolygonContainingCentre = true, CutObstacles = true;
-        public float RimExtension = 1f, RimMaxSlopeDeg = 80f;
-        public int RimHops = 3;
-        public bool ObstacleLocalHeight = true;
-        public bool RimRequireWall = true;
-        public float StepHeight = 0.5f;
-        public float SeamClose = 0.05f;
-        public float WallSnap = 0.5f;
-        public List<SavedSeal> Seals = [];
-        public List<SavedMeshMode> Meshes = [];
-        public List<string> DisabledLayers = [];
-        public bool AutoMapRan;
-        public List<SavedTriangleDelta> Added = [];
-        public List<SavedTriangleDelta> Removed = [];
-        public float Epsilon = 0.02f, Offset, Closing, Opening;
-        public int Decimals = 3;
-        public bool TrimCollinear = true;
-        public float DropAreaBelow;
-        public string ArenaFieldName = "arena";
-        public float FlatThreshold = 0.5f;
-        public bool EmitProjectionHeightZero;
-        public float LayerGap = 1f;
-        public float TerrainRadius = 120f;
-        public List<bool> ContourEnabled = [];
-        public List<SavedManualPolygon> ManualPolygons = [];
-        public List<float> DeletedVertices = []; // x,z pairs
-        public bool AdjustForHitboxInwards = true;
-    }
-
-    public sealed class ZoneArenaProjectFile
-    {
-        public int Version = 1;
-        public uint Territory;
-        public string Bg = "";
-        public Dictionary<string, ZoneArenaProject> Projects = [];
-    }
-
     private string _projectName = "";
     private string _projectStatus = "";
     private ZoneArenaProjectFile? _projectFile;
     private uint _projectFileTerritory = uint.MaxValue;
+    private bool _projectFileBroken; // the file on disk did not parse: it is kept as .bak by the next write
+    private string _projectFileSummary = "";
+    private readonly List<(string name, string summary)> _projectRows = [];
+    private string _deleteArmed = "";
+    private long _deleteArmedAt;
 
     private string ProjectPath(uint territory) => Path.Combine(_dalamud.ConfigDirectory.FullName, "zone-arenas", $"{territory}.json");
 
@@ -102,6 +26,7 @@ public sealed partial class ZoneArenaEditorWindow
             return _projectFile;
         }
         _projectFileTerritory = territory;
+        _projectFileBroken = false;
         _projectFile = new ZoneArenaProjectFile { Territory = territory };
         var path = ProjectPath(territory);
         if (File.Exists(path))
@@ -112,36 +37,74 @@ public sealed partial class ZoneArenaEditorWindow
             }
             catch (Exception ex)
             {
+                _projectFileBroken = true;
                 _projectStatus = $"load failed: {ex.Message}";
             }
         }
+        RefreshProjectSummaries(_projectFile);
         return _projectFile;
     }
 
+    // written to a temp file and moved over the old one, so a crash mid-write cannot leave a truncated project file
     private void WriteProjectFile(ZoneArenaProjectFile file)
     {
         var path = ProjectPath(file.Territory);
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllText(path, JsonSerializer.Serialize(file, Serialization.BuildSerializationOptions()));
+            if (_projectFileBroken && File.Exists(path))
+            {
+                File.Move(path, path + ".bak", true);
+                _projectFileBroken = false;
+            }
+            var tmp = path + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(file, Serialization.BuildSerializationOptions()));
+            File.Move(tmp, path, true);
             _projectStatus = $"saved {path}";
         }
         catch (Exception ex)
         {
             _projectStatus = $"save failed: {ex.Message}";
         }
+        _recentZonesStale = true;
+        RefreshProjectSummaries(file);
+    }
+
+    // the project list rows are built once per file load / write, not per frame
+    private void RefreshProjectSummaries(ZoneArenaProjectFile file)
+    {
+        _projectFileSummary = $"{file.Projects.Count} project(s) for territory {file.Territory} in {ProjectPath(file.Territory)}";
+        _projectRows.Clear();
+        foreach (var (name, p) in file.Projects)
+        {
+            var added = 0;
+            var removed = 0;
+            foreach (var d in p.Added)
+            {
+                added += d.Tris.Length;
+            }
+            foreach (var d in p.Removed)
+            {
+                removed += d.Tris.Length;
+            }
+            _projectRows.Add((name, $"{name}{(name == file.LastProject ? " (last)" : "")}: centre ({p.CenterX:f1}, {p.CenterZ:f1}), {added} added / {removed} removed, {p.ManualPolygons.Count} manual polygon(s), {p.Scenes.Count} scene(s), {p.Rules.Count} rule(s){(p.SavedAt != default ? $", {p.SavedAt:g}" : "")}"));
+        }
     }
 
     private static string Hex(ulong v) => v.ToString("X");
 
-    private void SaveProject(string name)
+    private void SaveProject(string name, bool remember = true)
     {
+        FlushPendingSeek();
         var scene = _scene!;
         var session = _session!;
         var s = session.Settings;
         var file = LoadProjectFile(scene.TerritoryId);
         file.Bg = scene.Bg;
+        if (remember)
+        {
+            file.LastProject = name;
+        }
         var p = new ZoneArenaProject
         {
             CenterX = session.Centre.X,
@@ -171,16 +134,35 @@ public sealed partial class ZoneArenaEditorWindow
             RimMaxSlopeDeg = s.RimMaxSlopeDeg,
             RimHops = s.RimHops,
             ObstacleLocalHeight = s.ObstacleLocalHeight,
+            ObstacleUnderFloor = s.ObstacleUnderFloor,
             RimRequireWall = s.RimRequireWall,
             StepHeight = s.StepHeight,
             SeamClose = s.SeamClose,
             WallSnap = s.WallSnap,
+            EdgeSnap = s.EdgeSnap,
+            GapBridge = s.GapBridge,
+            GapBridgeRise = s.GapBridgeRise,
+            ExcludeUnwalkableMaterials = s.ExcludeUnwalkableMaterials,
+            ReliefPromotion = s.ReliefPromotion,
+            ReliefStep = s.ReliefStep,
+            SealMaxThickness = s.SealMaxThickness,
+            SealMinWidth = s.SealMinWidth,
+            SealMinWidthToHeight = s.SealMinWidthToHeight,
+            SealBehindDepth = s.SealBehindDepth,
+            BoxFloorTouchEps = s.BoxFloorTouchEps,
+            BoxFloorTouchHeight = s.BoxFloorTouchHeight,
+            SeedSearchRadius = s.SeedSearchRadius,
+            SnapEpsXZ = s.SnapEpsXZ,
+            MinArea = s.MinArea,
+            ObstacleMaxTriangles = s.ObstacleMaxTriangles,
+            WallSnapVertices = s.WallSnapVertices,
             AutoMapRan = session.LastAutoResult.Count > 0,
             Epsilon = _pipeline.Epsilon,
             Offset = _pipeline.Offset,
             Closing = _pipeline.Closing,
             Opening = _pipeline.Opening,
             AdjustForHitboxInwards = _pipeline.AdjustForHitboxInwards,
+            AdjustForHitboxOutwards = _pipeline.AdjustForHitboxOutwards,
             Decimals = _pipeline.Decimals,
             TrimCollinear = _pipeline.TrimCollinear,
             DropAreaBelow = _pipeline.DropAreaBelow,
@@ -190,6 +172,7 @@ public sealed partial class ZoneArenaEditorWindow
             LayerGap = _pipeline.LayerGap,
             TerrainRadius = _terrainRadius,
         };
+        p.FloorMaterials.Clear();
         foreach (var f in s.FloorMaterials)
         {
             p.FloorMaterials.Add(f.ToString());
@@ -197,18 +180,27 @@ public sealed partial class ZoneArenaEditorWindow
         for (var i = 0; i < session.Seals.Count; ++i)
         {
             var box = scene.Boxes[session.Seals[i].BoxIndex];
-            p.Seals.Add(new SavedSeal { LayoutId = $"0x{box.LayoutObjectId:X16}", Use = session.ActiveSeals.Contains(box.Index) });
+            p.Seals.Add(new SavedSeal { LayoutId = ZoneSceneTimelineFile.FormatId(box.LayoutObjectId), NodeId = NodeHex(scene, box.NodeIndex), Use = session.ActiveSeals.Contains(box.Index) });
         }
         if (session.PairIndex >= 0 && session.PairIndex < session.Pairs.Count)
         {
             var pair = session.Pairs[session.PairIndex];
-            p.PairSealA = $"0x{scene.Boxes[session.Seals[pair.SealA].BoxIndex].LayoutObjectId:X16}";
-            p.PairSealB = pair.SealB >= 0 ? $"0x{scene.Boxes[session.Seals[pair.SealB].BoxIndex].LayoutObjectId:X16}" : "";
-            p.PairMarker = pair.MarkerIndex >= 0 ? $"0x{scene.Markers[pair.MarkerIndex].LayoutObjectId:X16}" : "";
+            var boxA = scene.Boxes[session.Seals[pair.SealA].BoxIndex];
+            p.PairSealA = ZoneSceneTimelineFile.FormatId(boxA.LayoutObjectId);
+            p.PairSealANode = NodeHex(scene, boxA.NodeIndex);
+            p.PairSealB = pair.SealB >= 0 ? ZoneSceneTimelineFile.FormatId(scene.Boxes[session.Seals[pair.SealB].BoxIndex].LayoutObjectId) : "";
+            p.PairSealBNode = pair.SealB >= 0 ? NodeHex(scene, scene.Boxes[session.Seals[pair.SealB].BoxIndex].NodeIndex) : "";
+            p.PairMarker = pair.MarkerIndex >= 0 ? ZoneSceneTimelineFile.FormatId(scene.Markers[pair.MarkerIndex].LayoutObjectId) : "";
+            p.PairMarkerNode = pair.MarkerIndex >= 0 ? NodeHex(scene, scene.Markers[pair.MarkerIndex].NodeIndex) : "";
+        }
+        foreach (var o in session.PairOverrides)
+        {
+            p.PairOverrides.Add(new SavedPairOverride { SealNode = ZoneSceneTimelineFile.FormatId(o.SealPathId), PartnerNode = o.PartnerPathId != 0 ? ZoneSceneTimelineFile.FormatId(o.PartnerPathId) : "", PartnerIsNode = o.PartnerIsNode });
         }
         foreach (var b in session.IgnoredBoxes)
         {
-            p.IgnoredBoxes.Add($"0x{scene.Boxes[b].LayoutObjectId:X16}");
+            p.IgnoredBoxes.Add(ZoneSceneTimelineFile.FormatId(scene.Boxes[b].LayoutObjectId));
+            p.IgnoredBoxNodes.Add(NodeHex(scene, scene.Boxes[b].NodeIndex));
         }
         p.CutBoxes = s.CutBoxes;
         p.ObstacleBoxMaterials.Clear();
@@ -218,22 +210,38 @@ public sealed partial class ZoneArenaEditorWindow
         }
         foreach (var b in session.SelectedFloorBoxes)
         {
-            p.FloorBoxes.Add($"0x{scene.Boxes[b].LayoutObjectId:X16}");
+            p.FloorBoxes.Add(ZoneSceneTimelineFile.FormatId(scene.Boxes[b].LayoutObjectId));
+            p.FloorBoxNodes.Add(NodeHex(scene, scene.Boxes[b].NodeIndex));
         }
         for (var m = 0; m < scene.Meshes.Count && m < _meshModes.Count; ++m)
         {
             if (_meshModes[m] != MeshMode.Auto)
             {
-                p.Meshes.Add(new SavedMeshMode { Path = scene.Meshes[m].PcbPath, LayoutId = $"0x{scene.Meshes[m].LayoutObjectId:X16}", Mode = _meshModes[m].ToString() });
+                p.Meshes.Add(new SavedMeshMode { Path = scene.Meshes[m].PcbPath, LayoutId = ZoneSceneTimelineFile.FormatId(scene.Meshes[m].LayoutObjectId), NodeId = NodeHex(scene, scene.Meshes[m].NodeIndex), Mode = _meshModes[m].ToString() });
             }
         }
-        foreach (var layer in scene.Layers)
+        EnsureDefaultScene();
+        ActiveScene?.State.CopyFrom(session.State);
+        foreach (var sc in session.Scenes)
         {
-            if (!layer.Enabled)
-            {
-                p.DisabledLayers.Add($"{layer.SourceFile}/{layer.Key}/{layer.Name}");
-            }
+            p.Scenes.Add(SavedScene.From(scene, sc));
         }
+        p.ActiveScene = session.ActiveSceneIndex;
+        foreach (var er in session.EObjRules)
+        {
+            p.EObjRules.Add(new SavedEObjRule { NodeId = ZoneSceneTimelineFile.FormatId(er.EObjPathId), ObjectStateChannel = er.ObjectStateChannel, State = er.State, CollisionOn = er.CollisionOn });
+        }
+        foreach (var r in _rules)
+        {
+            p.Rules.Add(r.Clone());
+        }
+        p.ReplayTimelinePath = _timelinePath;
+        p.View = CaptureView();
+        p.ModuleFilePath = _moduleFilePath;
+        p.SavedAt = DateTime.Now;
+        p.ResultPolygons = _pipeline.ExportEnabledPolygons(out var resultFlat, out var resultMeanY);
+        p.ResultFlat = resultFlat;
+        p.ResultMeanY = resultMeanY;
         // deltas against the auto-map result, grouped by mesh
         Dictionary<int, List<int>> added = [];
         Dictionary<int, List<int>> removed = [];
@@ -300,21 +308,67 @@ public sealed partial class ZoneArenaEditorWindow
     {
         var mesh = scene.Meshes[meshIndex];
         localTris.Sort();
-        return new SavedTriangleDelta { Path = mesh.PcbPath, LayoutId = $"0x{mesh.LayoutObjectId:X16}", TriangleCount = mesh.TriCount, Tris = [.. localTris] };
+        return new SavedTriangleDelta { Path = mesh.PcbPath, LayoutId = ZoneSceneTimelineFile.FormatId(mesh.LayoutObjectId), NodeId = NodeHex(scene, mesh.NodeIndex), TriangleCount = mesh.TriCount, Tris = [.. localTris] };
     }
 
-    private int FindMesh(string path, string layoutId)
+    private static string NodeHex(ZoneCollisionScene scene, int nodeIndex) => nodeIndex >= 0 ? ZoneSceneTimelineFile.FormatId(scene.Nodes[nodeIndex].PathId) : "";
+
+    // saved references resolve by node path id first (unique across shared-group instantiations), else by layout id (+ pcb path for meshes); the layout-id lookups are dictionaries built per scene size
+    private readonly Dictionary<string, int> _boxByLayoutId = [];
+    private readonly Dictionary<(string path, string layoutId), int> _meshByPathAndLayout = [];
+    private int _lookupBoxes = -1, _lookupMeshes = -1;
+
+    private void EnsureLookups()
     {
         var scene = _scene!;
-        for (var m = 0; m < scene.Meshes.Count; ++m)
+        if (_lookupBoxes != scene.Boxes.Count)
         {
-            var mesh = scene.Meshes[m];
-            if (mesh.PcbPath == path && $"0x{mesh.LayoutObjectId:X16}" == layoutId)
+            _boxByLayoutId.Clear();
+            for (var b = 0; b < scene.Boxes.Count; ++b)
             {
-                return m;
+                _boxByLayoutId.TryAdd(ZoneSceneTimelineFile.FormatId(scene.Boxes[b].LayoutObjectId), b);
+            }
+            _lookupBoxes = scene.Boxes.Count;
+        }
+        if (_lookupMeshes != scene.Meshes.Count)
+        {
+            _meshByPathAndLayout.Clear();
+            for (var m = 0; m < scene.Meshes.Count; ++m)
+            {
+                _meshByPathAndLayout.TryAdd((scene.Meshes[m].PcbPath, ZoneSceneTimelineFile.FormatId(scene.Meshes[m].LayoutObjectId)), m);
+            }
+            _lookupMeshes = scene.Meshes.Count;
+        }
+    }
+
+    private int FindMesh(string path, string layoutId, string nodeId = "")
+    {
+        var scene = _scene!;
+        if (nodeId.Length > 0)
+        {
+            var node = scene.FindNode(ZoneSceneTimelineFile.ParseId(nodeId));
+            if (node >= 0 && scene.Nodes[node].MeshIndex >= 0)
+            {
+                return scene.Nodes[node].MeshIndex;
             }
         }
-        return -1;
+        EnsureLookups();
+        return _meshByPathAndLayout.TryGetValue((path, layoutId), out var m) ? m : -1;
+    }
+
+    private int FindBox(string layoutId, string nodeId)
+    {
+        var scene = _scene!;
+        if (nodeId.Length > 0)
+        {
+            var node = scene.FindNode(ZoneSceneTimelineFile.ParseId(nodeId));
+            if (node >= 0 && scene.Nodes[node].BoxIndex >= 0)
+            {
+                return scene.Nodes[node].BoxIndex;
+            }
+        }
+        EnsureLookups();
+        return _boxByLayoutId.TryGetValue(layoutId, out var b) ? b : -1;
     }
 
     private void LoadProject(string name)
@@ -326,36 +380,36 @@ public sealed partial class ZoneArenaEditorWindow
         {
             return;
         }
+        if (p.FloorBoxes.Count != p.FloorBoxNodes.Count || p.IgnoredBoxes.Count != p.IgnoredBoxNodes.Count)
+        {
+            _projectStatus = $"'{name}' is malformed: its box and node id lists differ in length";
+            return;
+        }
         var s = session.Settings;
         s.FloorMaterials.Clear();
         foreach (var f in p.FloorMaterials)
         {
-            var slash = f.IndexOf('/');
-            if (slash > 0)
+            if (TryParseMaterial(f, out var mat))
             {
-                s.FloorMaterials.Add(new(Convert.ToUInt64(f[..slash], 16), Convert.ToUInt64(f[(slash + 1)..], 16)));
+                s.FloorMaterials.Add(mat);
             }
         }
         s.CutBoxes = p.CutBoxes;
         s.ObstacleBoxMaterials.Clear();
         foreach (var f in p.ObstacleBoxMaterials)
         {
-            var slash = f.IndexOf('/');
-            if (slash > 0)
+            if (TryParseMaterial(f, out var mat))
             {
-                s.ObstacleBoxMaterials.Add(new(Convert.ToUInt64(f[..slash], 16), Convert.ToUInt64(f[(slash + 1)..], 16)));
+                s.ObstacleBoxMaterials.Add(mat);
             }
         }
         session.IgnoredBoxes.Clear();
-        foreach (var id in p.IgnoredBoxes)
+        for (var i = 0; i < p.IgnoredBoxes.Count; ++i)
         {
-            for (var b = 0; b < scene.Boxes.Count; ++b)
+            var b = FindBox(p.IgnoredBoxes[i], p.IgnoredBoxNodes[i]);
+            if (b >= 0)
             {
-                if ($"0x{scene.Boxes[b].LayoutObjectId:X16}" == id)
-                {
-                    session.IgnoredBoxes.Add(b);
-                    break;
-                }
+                session.IgnoredBoxes.Add(b);
             }
         }
         if (s.FloorMaterials.Count == 0)
@@ -365,7 +419,7 @@ public sealed partial class ZoneArenaEditorWindow
         s.SealGeometryFilter = p.SealGeometryFilter;
         s.SealMaterialValue = Convert.ToUInt64(p.SealMaterialValue, 16);
         s.SealMaterialMask = Convert.ToUInt64(p.SealMaterialMask, 16);
-        s.FloorMatchMode = (CollisionOutlinesExtractor.MaterialMatchMode)p.FloorMatchMode;
+        s.FloorMatchMode = (MaterialMatchMode)p.FloorMatchMode;
         s.SealRequireExactMask = p.SealRequireExactMask;
         s.SealIncludeInactive = p.SealIncludeInactive;
         s.SealPairMaxDistance = p.SealPairMaxDistance;
@@ -385,15 +439,34 @@ public sealed partial class ZoneArenaEditorWindow
         s.RimMaxSlopeDeg = p.RimMaxSlopeDeg;
         s.RimHops = p.RimHops;
         s.ObstacleLocalHeight = p.ObstacleLocalHeight;
+        s.ObstacleUnderFloor = p.ObstacleUnderFloor;
         s.RimRequireWall = p.RimRequireWall;
         s.StepHeight = p.StepHeight;
         s.SeamClose = p.SeamClose;
         s.WallSnap = p.WallSnap;
+        s.EdgeSnap = p.EdgeSnap;
+        s.GapBridge = p.GapBridge;
+        s.GapBridgeRise = p.GapBridgeRise;
+        s.ExcludeUnwalkableMaterials = p.ExcludeUnwalkableMaterials;
+        s.ReliefPromotion = p.ReliefPromotion;
+        s.ReliefStep = p.ReliefStep;
+        s.SealMaxThickness = p.SealMaxThickness;
+        s.SealMinWidth = p.SealMinWidth;
+        s.SealMinWidthToHeight = p.SealMinWidthToHeight;
+        s.SealBehindDepth = p.SealBehindDepth;
+        s.BoxFloorTouchEps = p.BoxFloorTouchEps;
+        s.BoxFloorTouchHeight = p.BoxFloorTouchHeight;
+        s.SeedSearchRadius = p.SeedSearchRadius;
+        s.SnapEpsXZ = p.SnapEpsXZ;
+        s.MinArea = p.MinArea;
+        s.ObstacleMaxTriangles = p.ObstacleMaxTriangles;
+        s.WallSnapVertices = p.WallSnapVertices;
         _pipeline.Epsilon = p.Epsilon;
         _pipeline.Offset = p.Offset;
         _pipeline.Closing = p.Closing;
         _pipeline.Opening = p.Opening;
         _pipeline.AdjustForHitboxInwards = p.AdjustForHitboxInwards;
+        _pipeline.AdjustForHitboxOutwards = p.AdjustForHitboxOutwards && !p.AdjustForHitboxInwards;
         _pipeline.DeletedVertices.Clear();
         for (var i = 0; i + 1 < p.DeletedVertices.Count; i += 2)
         {
@@ -407,40 +480,59 @@ public sealed partial class ZoneArenaEditorWindow
         _pipeline.EmitProjectionHeightZero = p.EmitProjectionHeightZero;
         _pipeline.LayerGap = p.LayerGap;
         _terrainRadius = p.TerrainRadius;
+        _moduleFilePath = p.ModuleFilePath;
+        if (p.View != null)
+        {
+            ApplyView(p.View);
+        }
         SyncHexFromSettings();
 
-        foreach (var layer in scene.Layers)
+        // scenes
+        session.Scenes.Clear();
+        var missingSceneRefs = 0;
+        foreach (var ss in p.Scenes)
         {
-            layer.Enabled = !p.DisabledLayers.Contains($"{layer.SourceFile}/{layer.Key}/{layer.Name}");
+            session.Scenes.Add(ss.ToScene(scene, out var miss));
+            missingSceneRefs += miss;
         }
-        session.Adjacency = null;
+        EnsureDefaultScene();
+        session.EObjRules.Clear();
+        foreach (var er in p.EObjRules)
+        {
+            session.EObjRules.Add(new(ZoneSceneTimelineFile.ParseId(er.NodeId), er.ObjectStateChannel, er.State, er.CollisionOn));
+        }
+        session.ActivateScene(Math.Clamp(p.ActiveScene, 0, session.Scenes.Count - 1), false);
+        session.PairOverrides.Clear();
+        foreach (var o in p.PairOverrides)
+        {
+            session.PairOverrides.Add(new(ZoneSceneTimelineFile.ParseId(o.SealNode), o.PartnerNode.Length > 0 ? ZoneSceneTimelineFile.ParseId(o.PartnerNode) : 0ul, o.PartnerIsNode));
+        }
         session.DetectSeals();
         foreach (var saved in p.Seals)
         {
-            for (var i = 0; i < session.Seals.Count; ++i)
+            var b = FindBox(saved.LayoutId, saved.NodeId);
+            if (b >= 0 && session.Seals.Exists(sl => sl.BoxIndex == b))
             {
-                var box = scene.Boxes[session.Seals[i].BoxIndex];
-                if ($"0x{box.LayoutObjectId:X16}" == saved.LayoutId)
+                if (saved.Use)
                 {
-                    if (saved.Use)
-                    {
-                        session.ActiveSeals.Add(box.Index);
-                    }
-                    else
-                    {
-                        session.ActiveSeals.Remove(box.Index);
-                    }
+                    session.ActiveSeals.Add(b);
+                }
+                else
+                {
+                    session.ActiveSeals.Remove(b);
                 }
             }
         }
         session.PairIndex = -1;
+        var wantA = FindBox(p.PairSealA, p.PairSealANode);
+        var wantB = p.PairSealB.Length > 0 ? FindBox(p.PairSealB, p.PairSealBNode) : -1;
         for (var i = 0; i < session.Pairs.Count; ++i)
         {
             var pair = session.Pairs[i];
-            var a = $"0x{scene.Boxes[session.Seals[pair.SealA].BoxIndex].LayoutObjectId:X16}";
-            var b = pair.SealB >= 0 ? $"0x{scene.Boxes[session.Seals[pair.SealB].BoxIndex].LayoutObjectId:X16}" : "";
-            var mk = pair.MarkerIndex >= 0 ? $"0x{scene.Markers[pair.MarkerIndex].LayoutObjectId:X16}" : "";
-            if (a == p.PairSealA && b == p.PairSealB && mk == p.PairMarker)
+            var a = session.Seals[pair.SealA].BoxIndex;
+            var b = pair.SealB >= 0 ? session.Seals[pair.SealB].BoxIndex : -1;
+            var mk = pair.MarkerIndex >= 0 ? ZoneSceneTimelineFile.FormatId(scene.Markers[pair.MarkerIndex].LayoutObjectId) : "";
+            if (a == wantA && b == wantB && mk == p.PairMarker)
             {
                 session.PairIndex = i;
                 break;
@@ -448,15 +540,7 @@ public sealed partial class ZoneArenaEditorWindow
         }
         session.Centre = new(p.CenterX, p.CenterY, p.CenterZ);
         session.CentreValid = p.CentreValid;
-        if (_terrainRadius > 0f)
-        {
-            ZoneCollisionLoader.EnsureTerrainLoaded(scene, new LuminaZoneFileSource(Service.LuminaGameData), new(p.CenterX, p.CenterZ), _terrainRadius);
-            while (_meshModes.Count < scene.Meshes.Count)
-            {
-                _meshModes.Add(MeshMode.Auto);
-            }
-            _picker = new(scene);
-        }
+        LoadTerrainAround(new(p.CenterX, p.CenterZ));
         for (var m = 0; m < _meshModes.Count; ++m)
         {
             _meshModes[m] = MeshMode.Auto;
@@ -465,7 +549,7 @@ public sealed partial class ZoneArenaEditorWindow
         var missing = 0;
         foreach (var mm in p.Meshes)
         {
-            var m = FindMesh(mm.Path, mm.LayoutId);
+            var m = FindMesh(mm.Path, mm.LayoutId, mm.NodeId);
             if (m < 0)
             {
                 ++missing;
@@ -481,12 +565,34 @@ public sealed partial class ZoneArenaEditorWindow
         _selection.Reset();
         if (p.AutoMapRan)
         {
-            session.AutoMap();
+            // the flood fill runs on a task like the button does; the deltas and boxes are applied once it lands
+            _pendingProjectLoad = (p, name, missing, missingSceneRefs);
+            _projectStatus = $"loading '{name}': auto-map running...";
+            StartAutoMap();
+            return;
         }
-        else
+        session.LastAutoResult.Clear();
+        FinishProjectLoad(p, name, missing, missingSceneRefs);
+    }
+
+    private (ZoneArenaProject p, string name, int missing, int missingSceneRefs)? _pendingProjectLoad;
+
+    // "7000/F000" -> value / mask; false for anything that is not two hex numbers
+    private static bool TryParseMaterial(string text, out MaterialFilter filter)
+    {
+        filter = default;
+        var slash = text.IndexOf('/');
+        if (slash <= 0 || !ulong.TryParse(text.AsSpan(0, slash), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var value) || !TryParseHexMask(text[(slash + 1)..], out var mask))
         {
-            session.LastAutoResult.Clear();
+            return false;
         }
+        filter = new(value, mask);
+        return true;
+    }
+
+    private void FinishProjectLoad(ZoneArenaProject p, string name, int missing, int missingSceneRefs)
+    {
+        var session = _session!;
         foreach (var m in Enumerable.Range(0, _meshModes.Count))
         {
             if (_meshModes[m] == MeshMode.Exclude)
@@ -502,15 +608,12 @@ public sealed partial class ZoneArenaEditorWindow
         ApplyDeltas(p.Added, true, ref missing, ref skipped);
         ApplyDeltas(p.Removed, false, ref missing, ref skipped);
         session.SelectedFloorBoxes.Clear();
-        foreach (var id in p.FloorBoxes)
+        for (var i = 0; i < p.FloorBoxes.Count; ++i)
         {
-            for (var b = 0; b < scene.Boxes.Count; ++b)
+            var b = FindBox(p.FloorBoxes[i], p.FloorBoxNodes[i]);
+            if (b >= 0)
             {
-                if ($"0x{scene.Boxes[b].LayoutObjectId:X16}" == id)
-                {
-                    session.SelectedFloorBoxes.Add(b);
-                    break;
-                }
+                session.SelectedFloorBoxes.Add(b);
             }
         }
         _selection.ClearHistory(); // the loaded state is the new baseline
@@ -526,10 +629,37 @@ public sealed partial class ZoneArenaEditorWindow
             _manualPolygons.Add(poly);
         }
         _pendingContourFlags = p.ContourEnabled;
+        _rules.Clear();
+        foreach (var r in p.Rules)
+        {
+            _rules.Add(r.Clone());
+        }
+        _selectedRule = -1;
+        _ruleSnippetFor = -1;
+        _timeline = null;
+        _timelinePath = p.ReplayTimelinePath;
+        if (_timelinePath.Length > 0 && File.Exists(_timelinePath))
+        {
+            var open = _replayWindow?.Manager.LoadedReplays.FirstOrDefault(r => r.path == _timelinePath);
+            if (open?.replay != null)
+            {
+                StartTimelineImport(open.Value.replay, _timelinePath, false);
+            }
+            else
+            {
+                StartTimelineImport(_timelinePath, false);
+            }
+        }
+        ++_recomputeGen;
         MarkResultDirty();
         _resultDirtySince = 0;
-        _projectStatus = $"loaded '{name}': {session.Selected.Count} triangles{(missing > 0 ? $", {missing} mesh reference(s) not found" : "")}{(skipped > 0 ? $", {skipped} mesh delta(s) skipped (triangle count changed)" : "")}";
-        _canvas.Center = new(session.Centre.X, session.Centre.Z);
+        _projectStatus = $"loaded '{name}': {session.Selected.Count} triangles, {session.Scenes.Count} scene(s), {_rules.Count} rule(s){(missing > 0 ? $", {missing} mesh reference(s) not found" : "")}{(skipped > 0 ? $", {skipped} mesh delta(s) skipped (triangle count changed)" : "")}{(missingSceneRefs > 0 ? $", {missingSceneRefs} scene reference(s) not found" : "")}";
+        ReportProjectHealth(p, missing, skipped);
+        ResetEditHistory();
+        if (p.View == null || p.View.Zoom <= 0f)
+        {
+            _canvas.Center = new(session.Centre.X, session.Centre.Z);
+        }
     }
 
     private List<bool>? _pendingContourFlags;
@@ -540,7 +670,7 @@ public sealed partial class ZoneArenaEditorWindow
         var session = _session!;
         foreach (var d in deltas)
         {
-            var m = FindMesh(d.Path, d.LayoutId);
+            var m = FindMesh(d.Path, d.LayoutId, d.NodeId);
             if (m < 0)
             {
                 ++missing;
@@ -605,30 +735,48 @@ public sealed partial class ZoneArenaEditorWindow
         ImGui.SetNextItemWidth(160f);
         ImGui.InputText("name##project", ref _projectName, 64);
         ImGui.SameLine();
-        using (ImRaii.Disabled(_projectName.Length == 0))
+        var saveName = _projectName.Trim();
+        var loadInFlight = _pendingProjectLoad != null || _autoMapTask != null; // a load in flight has emptied the selection
+        using (ImRaii.Disabled(saveName.Length == 0 || loadInFlight))
         {
             if (ImGui.Button("Save"))
             {
-                SaveProject(_projectName);
+                SaveProject(saveName);
             }
         }
-        ImGui.TextDisabled($"{file.Projects.Count} project(s) for territory {scene.TerritoryId} in {ProjectPath(scene.TerritoryId)}");
+        Hint(loadInFlight ? "Wait for the running load / auto-map to finish" : "Save the working state under this name (a name in use is overwritten)");
+        ImGui.TextDisabled(_projectFileSummary);
         string? toDelete = null;
-        foreach (var (name, p) in file.Projects)
+        var now = Environment.TickCount64;
+        var armed = _deleteArmed.Length > 0 && now - _deleteArmedAt < 3000 ? _deleteArmed : "";
+        foreach (var (name, summary) in _projectRows)
         {
             using var id = ImRaii.PushId(name);
-            if (ImGui.SmallButton("load"))
+            using (ImRaii.Disabled(loadInFlight))
             {
-                _projectName = name;
-                LoadProject(name);
+                if (ImGui.SmallButton("load"))
+                {
+                    _projectName = name;
+                    LoadProject(name);
+                }
             }
             ImGui.SameLine();
-            if (ImGui.SmallButton("delete"))
+            if (ImGui.SmallButton(armed == name ? "confirm delete" : "delete"))
             {
-                toDelete = name;
+                if (armed == name)
+                {
+                    toDelete = name;
+                    _deleteArmed = "";
+                }
+                else
+                {
+                    _deleteArmed = name;
+                    _deleteArmedAt = now;
+                }
             }
+            Hint(armed == name ? "Click again to delete this project (no undo)" : "Click twice within 3 s to delete this project");
             ImGui.SameLine();
-            ImGui.TextUnformatted($"{name}: centre ({p.CenterX:f1}, {p.CenterZ:f1}), {p.Added.Sum(d => d.Tris.Length)} added / {p.Removed.Sum(d => d.Tris.Length)} removed, {p.ManualPolygons.Count} manual polygon(s)");
+            ImGui.TextUnformatted(summary);
         }
         if (toDelete != null)
         {
@@ -638,6 +786,16 @@ public sealed partial class ZoneArenaEditorWindow
         if (_projectStatus.Length > 0)
         {
             ImGui.TextWrapped(_projectStatus);
+        }
+        if (_projectHealth.Count > 0)
+        {
+            ImGui.TextDisabled("health:");
+            foreach (var line in _projectHealth)
+            {
+                ImGui.Bullet();
+                ImGui.SameLine();
+                ImGui.TextWrapped(line);
+            }
         }
     }
 }

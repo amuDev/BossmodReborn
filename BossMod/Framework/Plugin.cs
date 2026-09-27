@@ -144,7 +144,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
         _configUI = new(Service.Config, _ws, new DirectoryInfo(replayDir), _rotationDB);
         config.Modified.ExecuteAndSubscribe(() => _wndReplay.UpdateLogDirectory());
         _wndRotation = new(_rotation, _amex, () => OpenConfigUI("Autorotation presets"));
-        _wndDebug = new(_ws, _bossmod, _rotation, _zonemod, _amex, _movementOverride, _hintsBuilder, _dalamud, _rsr);
+        _wndDebug = new(_ws, _bossmod, _rotation, _zonemod, _amex, _movementOverride, _hintsBuilder, _dalamud, _rsr, _wndReplay);
 
         _dalamud.UiBuilder.DisableAutomaticUiHide = true;
         _dalamud.UiBuilder.Draw += DrawUI;

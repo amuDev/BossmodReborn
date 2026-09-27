@@ -2,10 +2,19 @@ using Clipper2Lib;
 
 namespace BossMod;
 
+// receives the polygons of a clipper tree walk: an outer, its direct holes, then EndOuter; islands inside holes come back as outers of their own
+public interface ITreeVisitor
+{
+    // false skips the outer and everything nested in it; holeCount = the direct holes the walk will report
+    bool Outer(Path64 path, int holeCount);
+    void Hole(Path64 path, int index);
+    void EndOuter();
+}
+
 // box colliders (entrance/exit seals) as XZ footprints: cut or unioned against floor polygons, optionally keeping only the polygon containing an anchor
 public static class BoxFootprintOps
 {
-    public const long DefaultScale = 1024L * 1024L;
+    public const long DefaultScale = TrianglePolygonBuilder.ClipperScale;
 
     // Andrew's monotone chain on the XZ projection
     public static Path64 ConvexHullXZ(ReadOnlySpan<Vector3> pts, long scale = DefaultScale)
@@ -14,7 +23,7 @@ public static class BoxFootprintOps
         var p = new Point64[n];
         for (var i = 0; i < n; ++i)
         {
-            p[i] = new Point64((long)Math.Round(pts[i].X * scale), (long)Math.Round(pts[i].Z * scale));
+            p[i] = TrianglePolygonBuilder.ToP64(pts[i], scale);
         }
         Array.Sort(p, (a, b) => a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y));
         var hull = new Path64(2 * n);
@@ -52,30 +61,37 @@ public static class BoxFootprintOps
         {
             hull = Clipper.ReversePath(hull);
         }
-        if (inflate != 0f && hull.Count >= 3)
-        {
-            var inflated = Clipper.InflatePaths([hull], inflate * scale, JoinType.Miter, EndType.Polygon);
-            if (inflated.Count > 0)
-            {
-                hull = inflated[0];
-                if (!Clipper.IsPositive(hull))
-                {
-                    hull = Clipper.ReversePath(hull);
-                }
-            }
-        }
-        return hull;
+        return Inflate(hull, inflate, scale);
     }
 
-    // morphological closing (inflate then deflate with miter joins): fills slits and notches narrower than 2r without moving the
-    // rest of the outline; Y is recovered from the input vertices
-    public static List<CollisionOutlinesExtractor.PolygonWithHoles> Close(List<CollisionOutlinesExtractor.PolygonWithHoles> polys, float radius, float minArea, long scale = DefaultScale)
+    // the footprint grown by 'inflate' yalms with miter joins (unchanged when zero); the input is never modified
+    public static Path64 Inflate(Path64 hull, float inflate, long scale = DefaultScale)
     {
-        if (polys.Count == 0 || radius <= 0f)
+        if (inflate == 0f || hull.Count < 3)
         {
-            return polys;
+            return hull;
         }
-        List<Vector3> ySource = [];
+        var inflated = Clipper.InflatePaths([hull], inflate * scale, JoinType.Miter, EndType.Polygon);
+        if (inflated.Count == 0)
+        {
+            return hull;
+        }
+        var result = inflated[0];
+        return Clipper.IsPositive(result) ? result : Clipper.ReversePath(result);
+    }
+
+    // inside or on the edge of the polygon
+    public static bool Contains(Path64 poly, Point64 p) => poly.Count >= 3 && Clipper.PointInPolygon(p, poly) != PointInPolygonResult.IsOutside;
+
+    // morphological closing on clipper paths (inflate then deflate with miter joins): fills slits and notches narrower than 2r without moving the
+    // rest of the outline
+    public static Paths64 ClosePaths(Paths64 paths, float radius, long scale = DefaultScale)
+        => Clipper.InflatePaths(Clipper.InflatePaths(paths, radius * scale, JoinType.Miter, EndType.Polygon), -radius * scale, JoinType.Miter, EndType.Polygon);
+
+    // the polygons as clipper subjects with the winding normalised (outers positive, holes negative) and their vertices collected as height sources:
+    // the NonZero fill rule cancels a positive union path against a negative outer, so mixed conventions would turn unioned boxes into holes
+    private static Paths64 ToSubjects(List<PolygonWithHoles> polys, List<Vector3> ySource, long scale)
+    {
         var paths = new Paths64();
         for (var i = 0; i < polys.Count; ++i)
         {
@@ -98,44 +114,32 @@ public static class BoxFootprintOps
                 ySource.AddRange(poly.Holes[h]);
             }
         }
-        var shaped = Clipper.InflatePaths(Clipper.InflatePaths(paths, radius * scale, JoinType.Miter, EndType.Polygon), -radius * scale, JoinType.Miter, EndType.Polygon);
+        return paths;
+    }
+
+    // morphological closing of polygons; Y is recovered from the input vertices
+    public static List<PolygonWithHoles> Close(List<PolygonWithHoles> polys, float radius, float minArea, long scale = DefaultScale)
+    {
+        if (polys.Count == 0 || radius <= 0f)
+        {
+            return polys;
+        }
+        List<Vector3> ySource = [];
+        var shaped = ClosePaths(ToSubjects(polys, ySource, scale), radius, scale);
         var tree = new PolyTree64();
         Clipper.BooleanOp(ClipType.Union, shaped, null, tree, FillRule.NonZero);
-        List<CollisionOutlinesExtractor.PolygonWithHoles> result = [];
-        AddTreePolygons(tree, result, ySource, (double)minArea * scale * scale, scale);
+        List<PolygonWithHoles> result = [];
+        AddTreePolygons(tree, result, new YSampler(ySource), (double)minArea * scale * scale, scale);
         return result;
     }
 
-    public static List<CollisionOutlinesExtractor.PolygonWithHoles> Apply(List<CollisionOutlinesExtractor.PolygonWithHoles> polys, List<Path64> cut, List<Path64> union, List<Vector3> boxYSource,
+    // cut and union paths applied to the polygons; with an anchor only the polygon containing it survives (the largest when it is in none)
+    public static List<PolygonWithHoles> Apply(List<PolygonWithHoles> polys, List<Path64> cut, List<Path64> union, List<Vector3> boxYSource,
         Vector2? keepAnchorXZ, float minArea, out string keepStatus, long scale = DefaultScale)
     {
         keepStatus = "";
         List<Vector3> ySource = [.. boxYSource];
-        var subject = new Paths64();
-        var count = polys.Count;
-        // normalise winding explicitly (outers positive, holes negative, unions positive): the NonZero fill rule cancels a
-        // positive union path against a negative outer, so mixed conventions turn unioned boxes into holes
-        for (var i = 0; i < count; ++i)
-        {
-            var poly = polys[i];
-            var outer = ToPath64(poly.Outer, false, scale);
-            if (!Clipper.IsPositive(outer))
-            {
-                outer.Reverse();
-            }
-            subject.Add(outer);
-            ySource.AddRange(poly.Outer);
-            for (var h = 0; h < poly.Holes.Count; ++h)
-            {
-                var hole = ToPath64(poly.Holes[h], false, scale);
-                if (Clipper.IsPositive(hole))
-                {
-                    hole.Reverse();
-                }
-                subject.Add(hole);
-                ySource.AddRange(poly.Holes[h]);
-            }
-        }
+        var subject = ToSubjects(polys, ySource, scale);
         for (var i = 0; i < union.Count; ++i)
         {
             var u = union[i];
@@ -157,16 +161,16 @@ public static class BoxFootprintOps
             Clipper.BooleanOp(ClipType.Union, subject, null, tree, FillRule.NonZero);
         }
 
-        List<CollisionOutlinesExtractor.PolygonWithHoles> result = [];
+        List<PolygonWithHoles> result = [];
         var minAreaScaled = (double)minArea * scale * scale;
-        AddTreePolygons(tree, result, ySource, minAreaScaled, scale);
+        AddTreePolygons(tree, result, new YSampler(ySource), minAreaScaled, scale);
 
-        if (keepAnchorXZ is { } anchorXZ && cut.Count > 0 && result.Count > 1)
+        if (keepAnchorXZ is { } anchorXZ && result.Count > 1)
         {
-            var anchor = new Point64((long)Math.Round(anchorXZ.X * scale), (long)Math.Round(anchorXZ.Y * scale));
+            var anchor = TrianglePolygonBuilder.ToP64(anchorXZ, scale);
             var keep = -1;
             var largest = -1;
-            var largestArea = 0.0;
+            var largestArea = 0d;
             for (var i = 0; i < result.Count; ++i)
             {
                 var outer = ToPath64(result[i].Outer, false, scale);
@@ -176,7 +180,7 @@ public static class BoxFootprintOps
                     largestArea = area;
                     largest = i;
                 }
-                if (keep < 0 && Clipper.PointInPolygon(anchor, outer) != PointInPolygonResult.IsOutside)
+                if (keep < 0 && Contains(outer, anchor))
                 {
                     keep = i;
                 }
@@ -188,32 +192,68 @@ public static class BoxFootprintOps
         return result;
     }
 
-    public static void AddTreePolygons(PolyPath64 node, List<CollisionOutlinesExtractor.PolygonWithHoles> dst, List<Vector3> ySource, double minAreaScaled, long scale = DefaultScale)
+    // depth-first over a clipper tree, outers with their direct holes; islands inside holes are outers of their own
+    public static void WalkTree<T>(PolyPath64 node, ref T visitor) where T : ITreeVisitor
     {
         var count = node.Count;
         for (var i = 0; i < count; ++i)
         {
             var outerNode = node[i];
-            if (outerNode.Polygon == null || outerNode.Polygon.Count < 3 || Math.Abs(Clipper.Area(outerNode.Polygon)) < minAreaScaled)
+            if (outerNode.Polygon == null || !visitor.Outer(outerNode.Polygon, outerNode.Count))
             {
                 continue;
             }
-            var poly = new CollisionOutlinesExtractor.PolygonWithHoles { Outer = PathToVectorsCCW(outerNode.Polygon, ySource, scale), Holes = [] };
             var holeCount = outerNode.Count;
             for (var h = 0; h < holeCount; ++h)
             {
                 var holeNode = outerNode[h];
-                if (holeNode.Polygon != null && holeNode.Polygon.Count >= 3 && Math.Abs(Clipper.Area(holeNode.Polygon)) >= minAreaScaled)
+                if (holeNode.Polygon != null)
                 {
-                    poly.Holes.Add(PathToVectorsCCW(holeNode.Polygon, ySource, scale));
+                    visitor.Hole(holeNode.Polygon, h);
                 }
-                AddTreePolygons(holeNode, dst, ySource, minAreaScaled, scale);
+                WalkTree(holeNode, ref visitor);
             }
-            dst.Add(poly);
+            visitor.EndOuter();
         }
     }
 
-    public static List<Vector3> PathToVectorsCCW(Path64 path, List<Vector3> ySource, long scale = DefaultScale)
+    private struct PolygonCollector(List<PolygonWithHoles> dst, IHeightSource ySource, double minAreaScaled, long scale) : ITreeVisitor
+    {
+        private PolygonWithHoles? _current;
+
+        public bool Outer(Path64 path, int holeCount)
+        {
+            if (path.Count < 3 || Math.Abs(Clipper.Area(path)) < minAreaScaled)
+            {
+                return false;
+            }
+            _current = new() { Outer = PathToVectorsCCW(path, ySource, scale), Holes = [] };
+            return true;
+        }
+
+        public readonly void Hole(Path64 path, int index)
+        {
+            if (path.Count >= 3 && Math.Abs(Clipper.Area(path)) >= minAreaScaled)
+            {
+                _current!.Holes.Add(PathToVectorsCCW(path, ySource, scale));
+            }
+        }
+
+        public void EndOuter()
+        {
+            dst.Add(_current!);
+            _current = null;
+        }
+    }
+
+    // the tree's polygons (contours below minAreaScaled dropped) with Y recovered from the height source
+    public static void AddTreePolygons(PolyPath64 node, List<PolygonWithHoles> dst, IHeightSource ySource, double minAreaScaled, long scale = DefaultScale)
+    {
+        var collector = new PolygonCollector(dst, ySource, minAreaScaled, scale);
+        WalkTree(node, ref collector);
+    }
+
+    public static List<Vector3> PathToVectorsCCW(Path64 path, IHeightSource ySource, long scale = DefaultScale)
     {
         if (!Clipper.IsPositive(path))
         {
@@ -223,9 +263,8 @@ public static class BoxFootprintOps
         List<Vector3> pts = new(n);
         for (var i = 0; i < n; ++i)
         {
-            var x = (float)(path[i].X / (double)scale);
-            var z = (float)(path[i].Y / (double)scale);
-            pts.Add(new(x, NearestY(ySource, x, z), z));
+            var p = path[i];
+            pts.Add(new((float)(p.X / (double)scale), ySource.Sample(p, scale), (float)(p.Y / (double)scale)));
         }
         return pts;
     }
@@ -238,36 +277,16 @@ public static class BoxFootprintOps
         {
             for (var i = n - 1; i >= 0; --i)
             {
-                path.Add(new Point64((long)Math.Round(pts[i].X * scale), (long)Math.Round(pts[i].Z * scale)));
+                path.Add(TrianglePolygonBuilder.ToP64(pts[i], scale));
             }
         }
         else
         {
             for (var i = 0; i < n; ++i)
             {
-                path.Add(new Point64((long)Math.Round(pts[i].X * scale), (long)Math.Round(pts[i].Z * scale)));
+                path.Add(TrianglePolygonBuilder.ToP64(pts[i], scale));
             }
         }
         return path;
-    }
-
-    public static float NearestY(List<Vector3> source, float x, float z)
-    {
-        var best = float.MaxValue;
-        var y = 0f;
-        var n = source.Count;
-        for (var i = 0; i < n; ++i)
-        {
-            var v = source[i];
-            var dx = v.X - x;
-            var dz = v.Z - z;
-            var d = dx * dx + dz * dz;
-            if (d < best)
-            {
-                best = d;
-                y = v.Y;
-            }
-        }
-        return y;
     }
 }

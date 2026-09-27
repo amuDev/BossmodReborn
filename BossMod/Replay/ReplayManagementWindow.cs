@@ -16,6 +16,8 @@ public sealed class ReplayManagementWindow : UIWindow
     private DirectoryInfo _logDir;
     private static readonly ReplayManagementConfig _config = Service.Config.Get<ReplayManagementConfig>();
     private readonly ReplayManager _manager;
+
+    public ReplayManager Manager => _manager;
     private readonly EventSubscriptions _subscriptions;
     private readonly BossModuleManager _bmm;
     private ReplayRecorder? _recorder;

@@ -1,8 +1,9 @@
 using Clipper2Lib;
+using System.Threading;
 
 namespace BossMod;
 
-public enum AdjacencyMode : byte { SharedEdge, SharedVertex }
+public enum AdjacencyMode : byte { SharedEdge, SharedVertex, EdgeInterval }
 public enum SealBlockMode : byte { BehindPlane, Centroid, AnyVertex }
 
 // masked material match: (material & Mask) == (Value & Mask); Mask 0 = exact
@@ -17,7 +18,7 @@ public sealed class AutoMapSettings
     // walkable floor materials: the 0x7xxx family covers terrain and most floors (0x7004 stone, 0x700A, 0x7005 ...); box colliders whose
     // object material matches (e.g. 0x700E transparent floor tiles) are treated as floor too
     public List<MaterialFilter> FloorMaterials = [new(0x7000, 0xF000)];
-    public CollisionOutlinesExtractor.MaterialMatchMode FloorMatchMode = CollisionOutlinesExtractor.MaterialMatchMode.EffectiveMasked;
+    public MaterialMatchMode FloorMatchMode = MaterialMatchMode.EffectiveMasked;
     public ulong SealMaterialValue = 0x2400;
     public ulong SealMaterialMask = 0x1FFFFFFFFF;
     public bool SealRequireExactMask = true;
@@ -29,11 +30,20 @@ public sealed class AutoMapSettings
     public float SealMinWidthToHeight = 0.5f;
     public float SealPairMaxDistance = 80f;
     public float MaxRadius = 60f;
-    public float MaxSlopeDeg = 45f;
+    public float MaxSlopeDeg = 55f;
     public float WeldEps = 1e-3f;
     public float StepHeight = 0.5f; // neighbours are linked across a vertical step up to this height (raised plates, kerbs); 0 = exact 3D weld only
     public float SeamClose = 0.05f; // morphological closing radius applied to the floor union: fuses hairline slits between plates/tiles whose outlines do not coincide exactly (they would become notches once the bounds are offset inwards)
-    public AdjacencyMode Adjacency = AdjacencyMode.SharedEdge;
+    public AdjacencyMode Adjacency = AdjacencyMode.EdgeInterval;
+    public float EdgeSnap = 0.02f; // EdgeInterval: two floor edges connect when they run collinear within this XZ distance and overlap along their length (T-junctions, seams between separately welded meshes)
+    public float GapBridge = 1f;   // two floor triangles whose edges come within this XZ gap at matching height connect (slatted bridges, plank ends floating over terrain, mesh seams that do not touch); 0 = off
+    public float GapBridgeRise = 0.7f; // extra height tolerance per yalm of gap (a plank end sits above the ground it leads onto)
+    // materials the game itself refuses to walk on (the 0x2000000 flag, and surface id 0x11) are never floor, whatever the whitelist or a forced-floor mesh says
+    public bool ExcludeUnwalkableMaterials = true;
+    // steep facets edge-connected to the floor are promoted when the whole patch is only a step rough around a walkable overall grade (rocky
+    // cave floors and terrain skins), instead of needing the mesh marked as floor by hand
+    public bool ReliefPromotion = true;
+    public float ReliefStep = 0.5f;
     public SealBlockMode SealBlock = SealBlockMode.BehindPlane;
     public float SealBehindDepth = 12f;       // BehindPlane: how far behind the seal plane triangles are blocked
     public float SealFootprintInflate = 0.05f;
@@ -50,6 +60,7 @@ public sealed class AutoMapSettings
     public float ObstacleHeightAbove = 2.5f; // obstacles entirely above floor + this are ignored (ceilings, bridges)
     public float ObstacleMinHeight = 0.25f;  // ignore flat decals / tiny steps
     public bool ObstacleLocalHeight = true;  // measure the height band against the selected floor under each obstacle (multi-level rooms) instead of the whole selection's Y range
+    public bool ObstacleUnderFloor = true;   // an obstacle's footprint is not cut where selected floor runs above it (a cliff face under a bridge, rocks under a plank): the 2D projection keeps the walkable surface
     // props without a collision mesh are box colliders: a designer-placed CollisionBox (mask 1FFFFFFFFF, material 0x2000 = the wall material)
     // usually paired with the model's own analytic box (mask FFFFFFFF, material 0x3005); boxes matching this list that stand on the floor are cut out
     public bool CutBoxes = true;
@@ -66,11 +77,19 @@ public sealed class AutoMapSettings
     public float WallSnap = 0.5f;
     public bool WallSnapVertices = true; // move final vertices within the obstacle inflate of a snapped wall foot onto the foot line / corner
 
+    public static bool IsUnwalkableMaterial(ulong material) => (material & 0x2000000) != 0 || (material & 0x1F) == 0x11;
+
+    public bool IsBlocked(in WorldTriangle t) => ExcludeUnwalkableMaterials && IsUnwalkableMaterial(t.Effective);
+
     public bool FloorMatches(in WorldTriangle t)
     {
-        var usePrim = FloorMatchMode is CollisionOutlinesExtractor.MaterialMatchMode.PrimExact or CollisionOutlinesExtractor.MaterialMatchMode.PrimMasked;
+        if (IsBlocked(t))
+        {
+            return false;
+        }
+        var usePrim = FloorMatchMode is MaterialMatchMode.PrimExact or MaterialMatchMode.PrimMasked;
         var material = usePrim ? t.Material : t.Effective;
-        var exact = FloorMatchMode is CollisionOutlinesExtractor.MaterialMatchMode.PrimExact or CollisionOutlinesExtractor.MaterialMatchMode.EffectiveExact;
+        var exact = FloorMatchMode is MaterialMatchMode.PrimExact or MaterialMatchMode.EffectiveExact;
         for (var i = 0; i < FloorMaterials.Count; ++i)
         {
             var f = FloorMaterials[i];
@@ -127,13 +146,21 @@ public sealed class AutoMapSettings
 
 public readonly record struct SealCandidate(int BoxIndex, Vector3 Center, Vector3 ThinAxisWorld, Vector3 LongAxisWorld, float Thickness, float Width, float Height, bool PassesGeometry, Path64 FootprintXZ, Path64 InflatedFootprintXZ);
 
-// a candidate pairing for the centre estimate: two seals, a seal and a layout marker (exit range / event object), or a single seal
-public readonly record struct SealPair(int SealA, int SealB, int MarkerIndex, float Distance, string Kind)
+// a seal with its partner: another seal of the same room, a node (warp, pop point, exit gate, exit range; MarkerIndex + its position in
+// Target) or nothing (Target = the room centre when the seal's area is known, so the inward side is still right); IsRoom = both seals of a boss arena
+public readonly record struct SealPair(int SealA, int SealB, int MarkerIndex, float Distance, string Kind, Vector3 Target = default, bool IsRoom = false)
 {
     public bool IsSingle => SealB < 0 && MarkerIndex < 0;
+    public bool HasTarget => Target != default;
 }
 
-public readonly record struct CentreEstimate(Vector3 Centre, int SealA, int SealB, int MarkerIndex, float RayGap, bool UsedFallback, string Reason);
+// the author's word over the automatic pairing: PartnerPathId 0 = keep this seal single, a seal box node = pair with that seal, a marker node = pair with that node
+public readonly record struct PairOverride(ulong SealPathId, ulong PartnerPathId, bool PartnerIsNode);
+
+// NoSeals: nothing to estimate from, the centre is the preferred point or the origin
+public readonly record struct CentreEstimate(Vector3 Centre, int SealA, int SealB, int MarkerIndex, float RayGap, bool UsedFallback, string Reason, bool NoSeals = false);
+
+public delegate bool MeshTest(int mesh, in Bounds3 worldBounds);
 
 // candidate floor triangles (material/slope/radius) plus floor boxes as extra nodes, with CSR neighbour lists built by welding vertices on a quantized grid
 public sealed class TriangleAdjacency
@@ -142,77 +169,133 @@ public sealed class TriangleAdjacency
     public int[] FloorBoxes = [];      // box indices, local node Candidates.Length + j
     public int[] NeighbourStart = [];
     public int[] Neighbours = [];
-    public readonly Dictionary<int, int> GlobalToLocal = [];
+    public int[] GlobalToLocal = [];   // indexed by global triangle, -1 when not a candidate
+    public TriangleGrid? CandidateGrid; // XZ grid over the candidates (null without candidates)
     public long BuildMs;
-    public int WeldedVertices, Edges, NonManifoldEdges, BoxLinks;
-    public float WeldEpsUsed;
+    public int Promoted, GapLinks, ForcedLinks;
 
     public int NodeCount => Candidates.Length + FloorBoxes.Length;
     public bool IsBoxNode(int local) => local >= Candidates.Length;
+    public int LocalOf(int global) => (uint)global < (uint)GlobalToLocal.Length ? GlobalToLocal[global] : -1;
 
     private const long CellOffset = 1L << 20;
     private const ulong CellMask = (1UL << 21) - 1;
 
-    private static ulong PackCell(long x, long y, long z) => (((ulong)(x + CellOffset) & CellMask) << 42) | (((ulong)(y + CellOffset) & CellMask) << 21) | ((ulong)(z + CellOffset) & CellMask);
+    // 21 bits per axis of a quantized position; the same packing keys welded vertices, rim chains and boundary edges
+    public static ulong PackCell(long x, long y, long z) => (((ulong)(x + CellOffset) & CellMask) << 42) | (((ulong)(y + CellOffset) & CellMask) << 21) | ((ulong)(z + CellOffset) & CellMask);
 
-    private static ulong CellKey(in Vector3 v, float eps) => PackCell((long)MathF.Floor(v.X / eps), (long)MathF.Floor(v.Y / eps), (long)MathF.Floor(v.Z / eps));
+    public static ulong WeldKey(in Vector3 v, float eps) => PackCell((long)MathF.Floor(v.X / eps), (long)MathF.Floor(v.Y / eps), (long)MathF.Floor(v.Z / eps));
+
+    public static ulong EdgeKey(ulong a, ulong b) => a < b ? a * 1000003UL ^ b : b * 1000003UL ^ a;
+
+    // every triangle of the enabled, non-empty meshes the test accepts, in mesh order; the visitor applies its own per-triangle window
+    public static void ForEachTriangleOfMeshes<T>(ZoneCollisionScene scene, MeshTest test, ref T visitor, CancellationToken ct = default) where T : struct, ITriangleVisitor
+    {
+        var meshes = scene.Meshes;
+        for (var m = 0; m < meshes.Count; ++m)
+        {
+            var mesh = meshes[m];
+            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || !test(m, mesh.WorldBounds))
+            {
+                continue;
+            }
+            var end = mesh.TriStart + mesh.TriCount;
+            for (var i = mesh.TriStart; i < end; ++i)
+            {
+                if ((i & 4095) == 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                }
+                visitor.Visit(i);
+            }
+        }
+    }
+
+    public static bool OverlapsBox(in Bounds3 b, float minX, float minZ, float maxX, float maxZ, float minY, float maxY)
+        => b.Max.X >= minX && b.Min.X <= maxX && b.Max.Z >= minZ && b.Min.Z <= maxZ && b.Max.Y >= minY && b.Min.Y <= maxY;
+
+    private struct CandidateCollector(ZoneTriangleStore store, AutoMapSettings s, bool[] forcedFloorMesh, HashSet<int> forced, PathRegion? region, Vector3 centre, List<int> candidates, List<int> steep) : ITriangleVisitor
+    {
+        private readonly float _minNormalY = s.MinNormalY;
+        private readonly float _r2 = s.MaxRadius * s.MaxRadius;
+
+        public void Visit(int i)
+        {
+            ref readonly var t = ref store[i];
+            if (forced.Contains(i))
+            {
+                candidates.Add(i); // walked on: floor by evidence
+                return;
+            }
+            if (s.IsBlocked(t) || (!forcedFloorMesh[t.MeshIndex] && !s.FloorMatches(t)))
+            {
+                return;
+            }
+            var walkable = t.NormalY >= _minNormalY;
+            if (!walkable && (!s.ReliefPromotion || t.NormalY < 1e-6f))
+            {
+                return;
+            }
+            var c = t.Centroid;
+            if (region != null)
+            {
+                if (!region.Contains(c))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                var dx = c.X - centre.X;
+                var dz = c.Z - centre.Z;
+                if (dx * dx + dz * dz > _r2)
+                {
+                    return;
+                }
+            }
+            (walkable ? candidates : steep).Add(i);
+        }
+    }
+
+    private struct WallCollector(ZoneTriangleStore store, float minNormalY, List<int> walls) : ITriangleVisitor
+    {
+        public void Visit(int i)
+        {
+            if (store[i].NormalY < minNormalY)
+            {
+                walls.Add(i);
+            }
+        }
+    }
+
+    // candidate triangles touching a floor box's inflated footprint
+    private struct BoxTouch(ZoneTriangleStore store, int[] globalToLocal, Path64 footprint, Bounds3 wb, float e2, float ey, long scale, List<(int a, int b)> pairs, int boxNode) : ITriangleVisitor
+    {
+        public void Visit(int g)
+        {
+            ref readonly var t = ref store[g];
+            if (!OverlapsBox(t.Bounds, wb.Min.X - e2, wb.Min.Z - e2, wb.Max.X + e2, wb.Max.Z + e2, wb.Min.Y - ey, wb.Max.Y + ey))
+            {
+                return;
+            }
+            if (BoxFootprintOps.Contains(footprint, TrianglePolygonBuilder.ToP64(t.A, scale)) || BoxFootprintOps.Contains(footprint, TrianglePolygonBuilder.ToP64(t.B, scale))
+                || BoxFootprintOps.Contains(footprint, TrianglePolygonBuilder.ToP64(t.C, scale)) || BoxFootprintOps.Contains(footprint, TrianglePolygonBuilder.ToP64(t.Centroid, scale)))
+            {
+                pairs.Add((globalToLocal[g], boxNode));
+            }
+        }
+    }
 
     // floorMeshes: meshes the author marked as floor regardless of material (transparent platforms, odd surface ids)
-    public static TriangleAdjacency Build(ZoneCollisionScene scene, in Vector3 centre, AutoMapSettings s, IReadOnlySet<int>? floorMeshes = null)
+    // region: candidates come from a corridor around a walked path instead of a ring around the centre; forcedTriangles are candidates whatever
+    // their material or slope (the player stood on them); forcedLinks join two candidates the player stepped between (a bridge the geometry does not join)
+    public static TriangleAdjacency Build(ZoneCollisionScene scene, in Vector3 centre, AutoMapSettings s, IReadOnlySet<int>? floorMeshes = null, PathRegion? region = null, IReadOnlyList<int>? forcedTriangles = null, IReadOnlyList<(int a, int b)>? forcedLinks = null, CancellationToken ct = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var adj = new TriangleAdjacency();
         var tris = scene.Triangles.Span;
         var minNormalY = s.MinNormalY;
-        var r2 = s.MaxRadius * s.MaxRadius;
         var cxz = new Vector2(centre.X, centre.Z);
-        List<int> candidates = [];
-        var meshes = scene.Meshes;
-        for (var m = 0; m < meshes.Count; ++m)
-        {
-            var mesh = meshes[m];
-            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || !mesh.WorldBounds.IntersectsXZCircle(cxz, s.MaxRadius))
-            {
-                continue;
-            }
-            var forcedFloor = floorMeshes != null && floorMeshes.Contains(m);
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
-            {
-                ref readonly var t = ref tris[i];
-                if (t.NormalY < minNormalY || (!forcedFloor && !s.FloorMatches(t)))
-                {
-                    continue;
-                }
-                var c = t.Centroid;
-                var dx = c.X - centre.X;
-                var dz = c.Z - centre.Z;
-                if (dx * dx + dz * dz > r2)
-                {
-                    continue;
-                }
-                candidates.Add(i);
-            }
-        }
-        adj.Candidates = [.. candidates];
-        var n = adj.Candidates.Length;
-        for (var i = 0; i < n; ++i)
-        {
-            adj.GlobalToLocal[adj.Candidates[i]] = i;
-        }
-
-        // floor boxes inside the radius become extra nodes
-        List<int> floorBoxes = [];
-        for (var b = 0; b < scene.Boxes.Count; ++b)
-        {
-            var box = scene.Boxes[b];
-            if (scene.IsBoxEnabled(b) && s.BoxIsFloor(box) && box.WorldBounds.IntersectsXZCircle(cxz, s.MaxRadius))
-            {
-                floorBoxes.Add(b);
-            }
-        }
-        adj.FloorBoxes = [.. floorBoxes];
-
         // weld vertices; 21 bits per axis at eps covers +-(2^20 * eps) yalms, fall back to a coarser grid for huge coordinates
         var eps = s.WeldEps;
         var maxCoord = MathF.Max(MathF.Abs(scene.Bounds.Min.X), MathF.Max(MathF.Abs(scene.Bounds.Max.X), MathF.Max(MathF.Abs(scene.Bounds.Min.Z), MathF.Abs(scene.Bounds.Max.Z))));
@@ -220,16 +303,142 @@ public sealed class TriangleAdjacency
         {
             eps *= 2f;
         }
-        adj.WeldEpsUsed = eps;
-        // with a step tolerance vertices weld in XZ only and each link is checked for its Y difference afterwards, so a raised
-        // plate (0.1 y step) still links to its neighbour while the ceiling slab above the floor does not
+        List<int> candidates = [];
+        List<int> steep = []; // material-eligible triangles that fail the slope test, for the relief promotion
+        HashSet<int> forced = forcedTriangles != null ? [.. forcedTriangles] : [];
+        var meshes = scene.Meshes;
+        var forcedFloorMesh = new bool[meshes.Count];
+        if (floorMeshes != null)
+        {
+            foreach (var m in floorMeshes)
+            {
+                if ((uint)m < (uint)forcedFloorMesh.Length)
+                {
+                    forcedFloorMesh[m] = true;
+                }
+            }
+        }
+        bool MeshNear(int m, in Bounds3 b) => region != null ? region.IntersectsBounds(b) : b.IntersectsXZCircle(cxz, s.MaxRadius);
+        var collector = new CandidateCollector(scene.Triangles, s, forcedFloorMesh, forced, region, centre, candidates, steep);
+        ForEachTriangleOfMeshes(scene, MeshNear, ref collector, ct);
+        if (steep.Count > 0)
+        {
+            adj.Promoted = ReliefPromotion.Promote(tris, candidates, steep, minNormalY, s.ReliefStep, eps, candidates);
+        }
+        ct.ThrowIfCancellationRequested();
+        adj.Candidates = [.. candidates];
+        var n = adj.Candidates.Length;
+        adj.GlobalToLocal = new int[scene.Triangles.Count];
+        Array.Fill(adj.GlobalToLocal, -1);
+        for (var i = 0; i < n; ++i)
+        {
+            adj.GlobalToLocal[adj.Candidates[i]] = i;
+        }
+        adj.CandidateGrid = n > 0 ? new TriangleGrid(tris, adj.Candidates) : null;
+
+        // floor boxes inside the radius become extra nodes
+        List<int> floorBoxes = [];
+        for (var b = 0; b < scene.Boxes.Count; ++b)
+        {
+            var box = scene.Boxes[b];
+            if (scene.IsBoxEnabled(b) && s.BoxIsFloor(box) && MeshNear(b, box.WorldBounds))
+            {
+                floorBoxes.Add(b);
+            }
+        }
+        adj.FloorBoxes = [.. floorBoxes];
+
+        var nodeCount = adj.NodeCount;
+        var counts = new int[nodeCount + 1];
+        List<(int a, int b)> pairs = [];
+        EdgeRec[]? edges = null;
+        if (s.Adjacency == AdjacencyMode.EdgeInterval)
+        {
+            edges = CandidateEdges(tris, adj.Candidates);
+            EdgeIntervalPairs(edges, s.EdgeSnap, s.StepHeight, pairs, ct);
+        }
+        else
+        {
+            WeldedPairs(tris, adj.Candidates, s, eps, pairs);
+        }
+        ct.ThrowIfCancellationRequested();
+
+        // floor boxes link to every candidate triangle touching their (inflated) footprint, and to each other when their footprints touch
+        var scale = BoxFootprintOps.DefaultScale;
+        var visited = adj.CandidateGrid != null && adj.FloorBoxes.Length > 0 ? new VisitStamp(scene.Triangles.Count) : null;
+        for (var j = 0; j < adj.FloorBoxes.Length; ++j)
+        {
+            var box = scene.Boxes[adj.FloorBoxes[j]];
+            var footprint = BoxFootprintOps.Inflate(box.FootprintXZ, s.BoxFloorTouchEps, scale);
+            var wb = box.WorldBounds;
+            var e2 = s.BoxFloorTouchEps;
+            var ey = s.BoxFloorTouchHeight;
+            if (adj.CandidateGrid != null)
+            {
+                var touch = new BoxTouch(scene.Triangles, adj.GlobalToLocal, footprint, wb, e2, ey, scale, pairs, n + j);
+                adj.CandidateGrid.ForEachInRect(wb.Min.X - e2, wb.Min.Z - e2, wb.Max.X + e2, wb.Max.Z + e2, visited, ref touch);
+            }
+            for (var k = 0; k < j; ++k)
+            {
+                var other = scene.Boxes[adj.FloorBoxes[k]].WorldBounds;
+                if (OverlapsBox(wb, other.Min.X - e2, other.Min.Z - e2, other.Max.X + e2, other.Max.Z + e2, other.Min.Y - ey, other.Max.Y + ey))
+                {
+                    pairs.Add((n + k, n + j));
+                }
+            }
+        }
+
+        if (s.GapBridge > 0f && n > 1)
+        {
+            edges ??= CandidateEdges(tris, adj.Candidates);
+            adj.GapLinks = GapLinkPairs(scene, edges, n, s, MeshNear, pairs, ct);
+        }
+        if (forcedLinks != null)
+        {
+            foreach (var (ga, gb) in forcedLinks)
+            {
+                var la = adj.LocalOf(ga);
+                var lb = adj.LocalOf(gb);
+                if (la >= 0 && lb >= 0 && la != lb)
+                {
+                    pairs.Add((la, lb));
+                    ++adj.ForcedLinks;
+                }
+            }
+        }
+        foreach (var (a, b) in pairs)
+        {
+            ++counts[a];
+            ++counts[b];
+        }
+        adj.NeighbourStart = new int[nodeCount + 1];
+        for (var i = 0; i < nodeCount; ++i)
+        {
+            adj.NeighbourStart[i + 1] = adj.NeighbourStart[i] + counts[i];
+        }
+        adj.Neighbours = new int[adj.NeighbourStart[nodeCount]];
+        var fill = new int[nodeCount];
+        foreach (var (a, b) in pairs)
+        {
+            adj.Neighbours[adj.NeighbourStart[a] + fill[a]++] = b;
+            adj.Neighbours[adj.NeighbourStart[b] + fill[b]++] = a;
+        }
+        adj.BuildMs = sw.ElapsedMilliseconds;
+        return adj;
+    }
+
+    // SharedEdge / SharedVertex: vertices welded on the eps grid; with a step tolerance vertices weld in XZ only and each link is checked for
+    // its Y difference afterwards, so a raised plate (0.1 y step) still links to its neighbour while the ceiling slab above the floor does not
+    private static void WeldedPairs(ReadOnlySpan<WorldTriangle> tris, int[] candidates, AutoMapSettings s, float eps, List<(int a, int b)> pairs)
+    {
+        var n = candidates.Length;
         var stepWeld = s.StepHeight > 0f;
         Dictionary<ulong, int> weld = new(n * 2);
         var triVerts = new int[3 * n];
         var triY = new float[3 * n];
         for (var i = 0; i < n; ++i)
         {
-            ref readonly var t = ref tris[adj.Candidates[i]];
+            ref readonly var t = ref tris[candidates[i]];
             triVerts[3 * i] = stepWeld ? WeldIdXZ(weld, t.A, eps) : WeldId(weld, t.A, eps);
             triVerts[3 * i + 1] = stepWeld ? WeldIdXZ(weld, t.B, eps) : WeldId(weld, t.B, eps);
             triVerts[3 * i + 2] = stepWeld ? WeldIdXZ(weld, t.C, eps) : WeldId(weld, t.C, eps);
@@ -237,7 +446,6 @@ public sealed class TriangleAdjacency
             triY[3 * i + 1] = t.B.Y;
             triY[3 * i + 2] = t.C.Y;
         }
-        adj.WeldedVertices = weld.Count;
         // true when every XZ-welded vertex the two triangles share sits within the step height in Y
         bool StepOk(int a, int b)
         {
@@ -254,9 +462,6 @@ public sealed class TriangleAdjacency
             return true;
         }
 
-        var nodeCount = adj.NodeCount;
-        var counts = new int[nodeCount + 1];
-        List<(int a, int b)> pairs = [];
         if (s.Adjacency == AdjacencyMode.SharedEdge)
         {
             Dictionary<ulong, (int first, int second)> edgeMap = new(3 * n);
@@ -274,7 +479,6 @@ public sealed class TriangleAdjacency
                     if (!edgeMap.TryGetValue(key, out var e))
                     {
                         edgeMap[key] = (i, -1);
-                        ++adj.Edges;
                     }
                     else if (e.second < 0)
                     {
@@ -295,7 +499,6 @@ public sealed class TriangleAdjacency
                         {
                             pairs.Add((e.second, i));
                         }
-                        ++adj.NonManifoldEdges;
                     }
                 }
             }
@@ -332,65 +535,7 @@ public sealed class TriangleAdjacency
                 }
             }
         }
-
-        // floor boxes link to every candidate triangle touching their (inflated) footprint, and to each other when their footprints touch
-        var scale = BoxFootprintOps.DefaultScale;
-        var boxPaths = new Path64[adj.FloorBoxes.Length];
-        for (var j = 0; j < adj.FloorBoxes.Length; ++j)
-        {
-            var box = scene.Boxes[adj.FloorBoxes[j]];
-            boxPaths[j] = BoxFootprintOps.BoxFootprint(box.Corners, s.BoxFloorTouchEps, scale);
-            var wb = box.WorldBounds;
-            var e2 = s.BoxFloorTouchEps;
-            var ey = s.BoxFloorTouchHeight;
-            for (var i = 0; i < n; ++i)
-            {
-                ref readonly var t = ref tris[adj.Candidates[i]];
-                var tb = t.Bounds;
-                if (tb.Max.X < wb.Min.X - e2 || tb.Min.X > wb.Max.X + e2 || tb.Max.Z < wb.Min.Z - e2 || tb.Min.Z > wb.Max.Z + e2 || tb.Max.Y < wb.Min.Y - ey || tb.Min.Y > wb.Max.Y + ey)
-                {
-                    continue;
-                }
-                if (PointIn(boxPaths[j], t.A, scale) || PointIn(boxPaths[j], t.B, scale) || PointIn(boxPaths[j], t.C, scale) || PointIn(boxPaths[j], t.Centroid, scale))
-                {
-                    pairs.Add((i, n + j));
-                    ++adj.BoxLinks;
-                }
-            }
-            for (var k = 0; k < j; ++k)
-            {
-                var other = scene.Boxes[adj.FloorBoxes[k]].WorldBounds;
-                if (wb.Max.X >= other.Min.X - e2 && wb.Min.X <= other.Max.X + e2 && wb.Max.Z >= other.Min.Z - e2 && wb.Min.Z <= other.Max.Z + e2 && wb.Max.Y >= other.Min.Y - ey && wb.Min.Y <= other.Max.Y + ey)
-                {
-                    pairs.Add((n + k, n + j));
-                    ++adj.BoxLinks;
-                }
-            }
-        }
-
-        foreach (var (a, b) in pairs)
-        {
-            ++counts[a];
-            ++counts[b];
-        }
-        adj.NeighbourStart = new int[nodeCount + 1];
-        for (var i = 0; i < nodeCount; ++i)
-        {
-            adj.NeighbourStart[i + 1] = adj.NeighbourStart[i] + counts[i];
-        }
-        adj.Neighbours = new int[adj.NeighbourStart[nodeCount]];
-        var fill = new int[nodeCount];
-        foreach (var (a, b) in pairs)
-        {
-            adj.Neighbours[adj.NeighbourStart[a] + fill[a]++] = b;
-            adj.Neighbours[adj.NeighbourStart[b] + fill[b]++] = a;
-        }
-        adj.BuildMs = sw.ElapsedMilliseconds;
-        return adj;
     }
-
-    private static bool PointIn(Path64 poly, in Vector3 p, long scale)
-        => poly.Count >= 3 && Clipper.PointInPolygon(new Point64((long)Math.Round(p.X * scale), (long)Math.Round(p.Z * scale)), poly) != PointInPolygonResult.IsOutside;
 
     private static int WeldIdXZ(Dictionary<ulong, int> weld, in Vector3 v, float eps)
     {
@@ -403,9 +548,258 @@ public sealed class TriangleAdjacency
         return id;
     }
 
+    // EdgeInterval adjacency: two triangles connect when one edge of each runs collinear in XZ within snap and they overlap along their length,
+    // with the height gap along the usable part of the overlap within the step height; shared edge intervals include T-junctions and the seams
+    // between separately welded meshes, while merely touching at a corner never joins islands or storeys (ported from the live arena's CanStep)
+    private readonly record struct EdgeRec(Vector3 A, Vector3 B, int Tri);
+
+    private static EdgeRec[] CandidateEdges(ReadOnlySpan<WorldTriangle> tris, int[] candidates)
+    {
+        var n = candidates.Length;
+        var edges = new EdgeRec[3 * n];
+        for (var i = 0; i < n; ++i)
+        {
+            ref readonly var t = ref tris[candidates[i]];
+            edges[3 * i] = new(t.A, t.B, i);
+            edges[3 * i + 1] = new(t.B, t.C, i);
+            edges[3 * i + 2] = new(t.C, t.A, i);
+        }
+        return edges;
+    }
+
+    private const float EdgeCell = 2f;
+
+    private static long PairKey(int a, int b) => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+
+    private static void EdgeIntervalPairs(EdgeRec[] edges, float snap, float step, List<(int a, int b)> pairs, CancellationToken ct)
+    {
+        var cells = new XZHashGrid(EdgeCell);
+        HashSet<long> tested = []; // a pair is decided once, whichever cells the two edges share
+        for (var e = 0; e < edges.Length; ++e)
+        {
+            if ((e & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            ref readonly var edge = ref edges[e];
+            var x0 = cells.CellOf(MathF.Min(edge.A.X, edge.B.X) - snap);
+            var x1 = cells.CellOf(MathF.Max(edge.A.X, edge.B.X) + snap);
+            var z0 = cells.CellOf(MathF.Min(edge.A.Z, edge.B.Z) - snap);
+            var z1 = cells.CellOf(MathF.Max(edge.A.Z, edge.B.Z) + snap);
+            for (var cz = z0; cz <= z1; ++cz)
+            {
+                for (var cx = x0; cx <= x1; ++cx)
+                {
+                    var list = cells.GetOrAddCell(cx, cz, out var isNew);
+                    if (isNew)
+                    {
+                        list.Add(e);
+                        continue;
+                    }
+                    for (var k = 0; k < list.Count; ++k)
+                    {
+                        ref readonly var other = ref edges[list[k]];
+                        if (other.Tri == edge.Tri || !tested.Add(PairKey(other.Tri, edge.Tri)) || !CanStep(edge, other, snap, step))
+                        {
+                            continue;
+                        }
+                        pairs.Add((other.Tri, edge.Tri));
+                    }
+                    list.Add(e);
+                }
+            }
+        }
+    }
+
+    // gap links: floor triangles that do not touch but come within GapBridge in XZ with their surfaces at matching height (a slatted bridge, a
+    // plank end hovering over the ground it leads onto, a seam between meshes that leaves a slit) connect, unless a wall stands in the gap
+    private static int GapLinkPairs(ZoneCollisionScene scene, EdgeRec[] edges, int n, AutoMapSettings s, MeshTest near, List<(int a, int b)> pairs, CancellationToken ct)
+    {
+        var gap = s.GapBridge;
+        // components of the graph so far: a gap link between two triangles already connected adds nothing and is skipped before any geometry
+        var sets = new UnionFind(n);
+        foreach (var (a, b) in pairs)
+        {
+            if (a < n && b < n)
+            {
+                sets.Union(a, b);
+            }
+        }
+        // walls near the region: anything steeper than the slope limit on an enabled mesh, whatever its material
+        List<int> walls = [];
+        var wallCollector = new WallCollector(scene.Triangles, s.MinNormalY, walls);
+        ForEachTriangleOfMeshes(scene, near, ref wallCollector, ct);
+        var wallGrid = walls.Count > 0 ? new TriangleGrid(scene.Triangles.Span, CollectionsMarshal.AsSpan(walls)) : null;
+        var cells = new XZHashGrid(EdgeCell);
+        var added = 0;
+        for (var e = 0; e < edges.Length; ++e)
+        {
+            if ((e & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            ref readonly var edge = ref edges[e];
+            var x0 = cells.CellOf(MathF.Min(edge.A.X, edge.B.X) - gap);
+            var x1 = cells.CellOf(MathF.Max(edge.A.X, edge.B.X) + gap);
+            var z0 = cells.CellOf(MathF.Min(edge.A.Z, edge.B.Z) - gap);
+            var z1 = cells.CellOf(MathF.Max(edge.A.Z, edge.B.Z) + gap);
+            for (var cz = z0; cz <= z1; ++cz)
+            {
+                for (var cx = x0; cx <= x1; ++cx)
+                {
+                    var list = cells.GetOrAddCell(cx, cz, out var isNew);
+                    if (isNew)
+                    {
+                        list.Add(e);
+                        continue;
+                    }
+                    for (var k = 0; k < list.Count; ++k)
+                    {
+                        ref readonly var other = ref edges[list[k]];
+                        if (other.Tri == edge.Tri || sets.Find(other.Tri) == sets.Find(edge.Tri))
+                        {
+                            continue;
+                        }
+                        if (!GapBridgeable(edge, other, gap, s.StepHeight, s.GapBridgeRise, scene.Triangles, wallGrid))
+                        {
+                            continue;
+                        }
+                        sets.Union(other.Tri, edge.Tri);
+                        pairs.Add((other.Tri, edge.Tri));
+                        ++added;
+                    }
+                    list.Add(e);
+                }
+            }
+        }
+        return added;
+    }
+
+    private struct GapWallTest(ZoneTriangleStore store, Vector2 s0, Vector2 s1, float lowY, float highY) : ITriangleVisitor
+    {
+        public bool Blocked;
+
+        public void Visit(int w)
+        {
+            if (Blocked)
+            {
+                return;
+            }
+            ref readonly var t = ref store[w];
+            var wb = t.Bounds;
+            if (wb.Max.Y < lowY || wb.Min.Y > highY)
+            {
+                return;
+            }
+            Blocked = SegmentCrossesTriangleXZ(s0, s1, t);
+        }
+    }
+
+    // closest points of the two edges in XZ within the gap, surfaces within the step (plus the rise allowance) there, no wall crossing the gap
+    private static bool GapBridgeable(in EdgeRec a, in EdgeRec b, float gap, float step, float rise, ZoneTriangleStore store, TriangleGrid? walls)
+    {
+        var (d2, ta, tb) = ArenaAutoMapper.SegmentDistSqXZ(a.A, a.B, b.A, b.B);
+        if (d2 > gap * gap || d2 < 1e-4f * 1e-4f)
+        {
+            return false;
+        }
+        var d = MathF.Sqrt(d2);
+        var pa = Vector3.Lerp(a.A, a.B, ta);
+        var pb = Vector3.Lerp(b.A, b.B, tb);
+        if (MathF.Abs(pa.Y - pb.Y) > step + rise * d)
+        {
+            return false;
+        }
+        if (walls == null)
+        {
+            return true;
+        }
+        // a wall triangle whose XZ shape the gap segment crosses, in the height band of the crossing, blocks the link (thin walls between two floors)
+        var test = new GapWallTest(store, new(pa.X, pa.Z), new(pb.X, pb.Z), MathF.Min(pa.Y, pb.Y) - 0.3f, MathF.Max(pa.Y, pb.Y) + 1.8f);
+        walls.ForEachInRect(MathF.Min(pa.X, pb.X), MathF.Min(pa.Z, pb.Z), MathF.Max(pa.X, pb.X), MathF.Max(pa.Z, pb.Z), null, ref test);
+        return !test.Blocked;
+    }
+
+    private static bool SegmentCrossesTriangleXZ(Vector2 s0, Vector2 s1, in WorldTriangle t)
+    {
+        Vector2 a = new(t.A.X, t.A.Z), b = new(t.B.X, t.B.Z), c = new(t.C.X, t.C.Z);
+        return t.ContainsXZ(s0.X, s0.Y) || t.ContainsXZ(s1.X, s1.Y) || SegmentsIntersect(s0, s1, a, b) || SegmentsIntersect(s0, s1, b, c) || SegmentsIntersect(s0, s1, c, a);
+
+        static float Cross(Vector2 u, Vector2 v) => u.X * v.Y - u.Y * v.X;
+        static bool SegmentsIntersect(Vector2 p, Vector2 p2, Vector2 q, Vector2 q2)
+        {
+            var r = p2 - p;
+            var s = q2 - q;
+            var denom = Cross(r, s);
+            if (MathF.Abs(denom) < 1e-9f)
+            {
+                return false;
+            }
+            var t = Cross(q - p, s) / denom;
+            var u = Cross(q - p, r) / denom;
+            return t >= 0f && t <= 1f && u >= 0f && u <= 1f;
+        }
+    }
+
+    private static bool CanStep(EdgeRec a, EdgeRec b, float snap, float step)
+    {
+        // refer to the longer edge so a tiny segment does not magnify the other edge's endpoint roundoff when testing collinearity
+        if (XZLengthSq(b) > XZLengthSq(a))
+        {
+            (a, b) = (b, a);
+        }
+        double dx = a.B.X - a.A.X, dz = a.B.Z - a.A.Z;
+        var length = Math.Sqrt(dx * dx + dz * dz);
+        if (length <= 1e-6d)
+        {
+            return false;
+        }
+        dx /= length;
+        dz /= length;
+        double bax = b.A.X - a.A.X, baz = b.A.Z - a.A.Z, bbx = b.B.X - a.A.X, bbz = b.B.Z - a.A.Z;
+        var separation = Math.Max(Math.Abs(dx * baz - dz * bax), Math.Abs(dx * bbz - dz * bbx));
+        if (separation > snap)
+        {
+            return false;
+        }
+        // the snap distance is not a minimum edge length: sub-snap shared intervals are useful on rocky meshes when the edges coincide
+        var minimum = separation <= 1e-5d ? 1e-5d : snap;
+        var start = bax * dx + baz * dz;
+        var end = bbx * dx + bbz * dz;
+        var low = Math.Max(0d, Math.Min(start, end));
+        var high = Math.Min(length, Math.Max(start, end));
+        if (high - low <= minimum || Math.Abs(end - start) <= minimum)
+        {
+            return false;
+        }
+        // the height difference varies linearly along the overlap: keep the usable interval instead of rejecting a whole ramp edge for its high end
+        var gapLow = Gap(low);
+        var gapHigh = Gap(high);
+        var limit = step + snap;
+        var change = gapHigh - gapLow;
+        if (Math.Abs(change) < 1e-6d)
+        {
+            return Math.Abs(gapLow) <= limit;
+        }
+        var t0 = (-limit - gapLow) / change;
+        var t1 = (limit - gapLow) / change;
+        var begin = Math.Max(0d, Math.Min(t0, t1));
+        var finish = Math.Min(1d, Math.Max(t0, t1));
+        return begin < finish && (high - low) * (finish - begin) > minimum;
+
+        double Gap(double p) => a.A.Y + (a.B.Y - a.A.Y) * (p / length) - (b.A.Y + (b.B.Y - b.A.Y) * ((p - start) / (end - start)));
+    }
+
+    private static float XZLengthSq(in EdgeRec e)
+    {
+        var dx = e.B.X - e.A.X;
+        var dz = e.B.Z - e.A.Z;
+        return dx * dx + dz * dz;
+    }
+
     private static int WeldId(Dictionary<ulong, int> weld, in Vector3 v, float eps)
     {
-        var key = CellKey(v, eps);
+        var key = WeldKey(v, eps);
         if (!weld.TryGetValue(key, out var id))
         {
             id = weld.Count;
@@ -415,51 +809,162 @@ public sealed class TriangleAdjacency
     }
 
     public ReadOnlySpan<int> NeighboursOf(int local) => Neighbours.AsSpan(NeighbourStart[local], NeighbourStart[local + 1] - NeighbourStart[local]);
+
+    // breadth-first over the neighbour lists from the seeds (local nodes): the visitor accepts or refuses each node when it is discovered
+    // (seeds at depth 0), refused nodes are neither taken nor expanded, and nodes at maxDepth are taken but not expanded
+    public void Walk<T>(ReadOnlySpan<int> seeds, int maxDepth, ref T visitor, CancellationToken ct = default) where T : struct, IWalkVisitor
+    {
+        var nodeCount = NodeCount;
+        var visited = new bool[nodeCount];
+        var queue = new int[nodeCount];
+        var depth = new int[nodeCount];
+        var head = 0;
+        var tail = 0;
+        foreach (var seed in seeds)
+        {
+            if ((uint)seed < (uint)nodeCount && !visited[seed])
+            {
+                visited[seed] = true;
+                if (visitor.Enter(seed, 0))
+                {
+                    queue[tail++] = seed;
+                }
+            }
+        }
+        while (head < tail)
+        {
+            if ((head & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            var cur = queue[head++];
+            var d = depth[cur];
+            if (d >= maxDepth)
+            {
+                continue;
+            }
+            foreach (var nb in NeighboursOf(cur))
+            {
+                if (visited[nb])
+                {
+                    continue;
+                }
+                visited[nb] = true;
+                if (visitor.Enter(nb, d + 1))
+                {
+                    depth[nb] = d + 1;
+                    queue[tail++] = nb;
+                }
+            }
+        }
+    }
+}
+
+public interface IWalkVisitor
+{
+    bool Enter(int node, int depth);
 }
 
 public sealed class AutoMapResult
 {
     public Vector3 Centre;
-    public int SeedTriangle = -1;
     public int[] Selected = [];
     public int[] SelectedBoxes = [];
-    public int[] BlockedBySeal = [];
     public string Status = "";
-    public long AdjacencyMs, FillMs;
+    public long FillMs;
+}
+
+// which boxes classify as seals (IsSealBox: material and geometry): the box and the seal settings decide that, the scene state does not, so a
+// re-detect after a scene change only re-reads which of them are placed / enabled. Boxes are fixed once the scene is loaded
+public sealed class SealClassCache
+{
+    private ZoneCollisionScene? _scene;
+    private int _boxCount = -1;
+    private ulong _materialValue, _materialMask;
+    private bool _requireExactMask, _geometryFilter;
+    private float _maxThickness, _minWidth, _minWidthToHeight, _footprintInflate;
+    private readonly List<SealCandidate> _seals = [];
+
+    // every box that passes IsSealBox under the settings, in box order
+    public List<SealCandidate> Classified(ZoneCollisionScene scene, AutoMapSettings s)
+    {
+        if (_scene == scene && _boxCount == scene.Boxes.Count && _materialValue == s.SealMaterialValue && _materialMask == s.SealMaterialMask && _requireExactMask == s.SealRequireExactMask
+            && _geometryFilter == s.SealGeometryFilter && _maxThickness == s.SealMaxThickness && _minWidth == s.SealMinWidth && _minWidthToHeight == s.SealMinWidthToHeight && _footprintInflate == s.SealFootprintInflate)
+        {
+            return _seals;
+        }
+        _seals.Clear();
+        var boxes = scene.Boxes;
+        for (var i = 0; i < boxes.Count; ++i)
+        {
+            if (ArenaAutoMapper.IsSealBox(boxes[i], s, out var seal))
+            {
+                _seals.Add(seal);
+            }
+        }
+        _scene = scene;
+        _boxCount = boxes.Count;
+        _materialValue = s.SealMaterialValue;
+        _materialMask = s.SealMaterialMask;
+        _requireExactMask = s.SealRequireExactMask;
+        _geometryFilter = s.SealGeometryFilter;
+        _maxThickness = s.SealMaxThickness;
+        _minWidth = s.SealMinWidth;
+        _minWidthToHeight = s.SealMinWidthToHeight;
+        _footprintInflate = s.SealFootprintInflate;
+        return _seals;
+    }
 }
 
 public static class ArenaAutoMapper
 {
+    // FindSeals over the cached classification: the same list (a new one per call, box order), only the placed / enabled part is evaluated
+    public static List<SealCandidate> FindSeals(ZoneCollisionScene scene, AutoMapSettings s, SealClassCache cache)
+    {
+        List<SealCandidate> result = [];
+        var classified = cache.Classified(scene, s);
+        for (var i = 0; i < classified.Count; ++i)
+        {
+            var box = classified[i].BoxIndex;
+            if (!scene.IsBoxPlaced(box) || (!s.SealIncludeInactive && !scene.IsBoxEnabled(box)))
+            {
+                continue;
+            }
+            result.Add(classified[i]);
+        }
+        return result;
+    }
+
+    // seals are listed while their instance is placed in the scene; a seal whose event object currently has the collision removed is listed
+    // only with SealIncludeInactive (it is still a room boundary the author may want to cut)
     public static List<SealCandidate> FindSeals(ZoneCollisionScene scene, AutoMapSettings s)
     {
         List<SealCandidate> result = [];
         var boxes = scene.Boxes;
         for (var i = 0; i < boxes.Count; ++i)
         {
-            var b = boxes[i];
-            if (b.Kind != LgbColliderKind.Box || !scene.IsBoxEnabled(i))
+            if (!scene.IsBoxPlaced(i) || (!s.SealIncludeInactive && !scene.IsBoxEnabled(i)))
             {
                 continue;
             }
-            if ((b.MatValue & s.SealMaterialMask) != (s.SealMaterialValue & s.SealMaterialMask))
-            {
-                continue;
-            }
-            if (s.SealRequireExactMask && b.MatMask != s.SealMaterialMask)
-            {
-                continue;
-            }
-            if (!s.SealIncludeInactive && !b.ActiveByDefault)
-            {
-                continue;
-            }
-            var seal = MakeSeal(b, s);
-            if (!s.SealGeometryFilter || seal.PassesGeometry)
+            if (IsSealBox(boxes[i], s, out var seal))
             {
                 result.Add(seal);
             }
         }
         return result;
+    }
+
+    // seal material (and exact designer mask), thin-wide-door geometry when the filter is on
+    public static bool IsSealBox(ZoneBoxInstance b, AutoMapSettings s, out SealCandidate seal)
+    {
+        seal = default;
+        if (b.Kind != LgbColliderKind.Box || (b.MatValue & s.SealMaterialMask) != (s.SealMaterialValue & s.SealMaterialMask) || (s.SealRequireExactMask && b.MatMask != s.SealMaterialMask))
+        {
+            return false;
+        }
+        seal = MakeSeal(b, s);
+        return !s.SealGeometryFilter || seal.PassesGeometry;
     }
 
     public static SealCandidate MakeSeal(ZoneBoxInstance b, AutoMapSettings s)
@@ -493,53 +998,287 @@ public static class ArenaAutoMapper
         var width = 2f * longLen;
         var height = 2f * rows[vertical].Length();
         var passes = thickness <= s.SealMaxThickness && width >= s.SealMinWidth && width >= height * s.SealMinWidthToHeight && vertical != thin;
-        var footprint = BoxFootprintOps.BoxFootprint(b.Corners, 0f);
-        var inflated = BoxFootprintOps.BoxFootprint(b.Corners, s.SealFootprintInflate);
+        var footprint = b.FootprintXZ;
+        var inflated = BoxFootprintOps.Inflate(footprint, s.SealFootprintInflate);
         return new(b.Index, b.Center, axis, longDir, thickness, width, height, passes, footprint, inflated);
     }
 
-    // candidate pairings: every two seals within range (both oriented toward each other), every seal + marker within range, and each seal alone
-    public static List<SealPair> ComputePairs(List<SealCandidate> seals, List<ZoneMarker> markers, AutoMapSettings s)
+    // pairing from the layout: every seal belongs to one room. Seals inside the same boss arena (map range with map 0) pair with each other;
+    // seals left alone pair with the nearest node on their inward side (warp, player pop point / landing, exit gate, exit range); the rest stay
+    // single but know which side the room is on. Overrides replace the automatic choice for their seal
+    public static List<SealPair> AutoPairRooms(List<SealCandidate> seals, ZoneCollisionScene scene, ZoneSceneModel model, AutoMapSettings s, IReadOnlyList<PairOverride>? overrides = null)
     {
-        List<SealPair> pairs = [];
-        for (var i = 0; i < seals.Count; ++i)
+        var n = seals.Count;
+        // only map ranges with map 0 mark boss arenas; a zone without them (older dungeons) pairs by geometry alone
+        var bossAreas = model.Areas.Where(a => a.Map == 0).ToList();
+        // the boss area of each seal: the smallest one whose bounds (inflated, seals sit on the edge) contain its centre
+        var areaOf = new int[n];
+        // two seal boxes at the same door (a vfx box over a bg box): the later one is a duplicate and follows the first
+        var duplicateOf = new int[n];
+        Array.Fill(duplicateOf, -1);
+        for (var i = 0; i < n; ++i)
         {
-            for (var j = i + 1; j < seals.Count; ++j)
+            for (var j = 0; j < i; ++j)
             {
-                var d = (seals[j].Center - seals[i].Center).Length();
-                if (d <= s.SealPairMaxDistance && d >= 0.5f)
+                if (duplicateOf[j] < 0 && (seals[i].Center - seals[j].Center).Length() < 3f && MathF.Abs(Vector3.Dot(seals[i].ThinAxisWorld, seals[j].ThinAxisWorld)) > 0.9f)
                 {
-                    pairs.Add(new(i, j, -1, d, "seals"));
+                    duplicateOf[i] = j;
+                    break;
                 }
             }
         }
-        for (var i = 0; i < seals.Count; ++i)
+        for (var i = 0; i < n; ++i)
         {
-            for (var m = 0; m < markers.Count; ++m)
+            areaOf[i] = -1;
+            var bestSize = float.MaxValue;
+            for (var a = 0; a < bossAreas.Count; ++a)
             {
-                if (markers[m].Type != (int)LgbInstanceType.ExitRange)
+                var b = bossAreas[a].WorldBounds;
+                var c = seals[i].Center;
+                if (c.X >= b.Min.X - 4f && c.X <= b.Max.X + 4f && c.Z >= b.Min.Z - 4f && c.Z <= b.Max.Z + 4f && c.Y >= b.Min.Y - 8f && c.Y <= b.Max.Y + 8f)
+                {
+                    var size = (b.Max.X - b.Min.X) * (b.Max.Z - b.Min.Z);
+                    if (size < bestSize)
+                    {
+                        bestSize = size;
+                        areaOf[i] = a;
+                    }
+                }
+            }
+        }
+        var partner = new int[n];
+        Array.Fill(partner, -1);
+        List<SealPair> pairs = [];
+        // (1) within a boss area: the two seals whose inward rays meet best
+        foreach (var group in Enumerable.Range(0, n).Where(i => areaOf[i] >= 0 && duplicateOf[i] < 0).GroupBy(i => areaOf[i]))
+        {
+            var members = group.ToList();
+            while (members.Count >= 2)
+            {
+                var best = (i: -1, j: -1, gap: float.MaxValue);
+                for (var x = 0; x < members.Count; ++x)
+                {
+                    for (var y = x + 1; y < members.Count; ++y)
+                    {
+                        var i = members[x];
+                        var j = members[y];
+                        if ((seals[i].Center - seals[j].Center).Length() < 4f)
+                        {
+                            continue; // the same doorway
+                        }
+                        var est = TwoRays(new(i, j, -1, 0f, "room"), seals[i], seals[j]);
+                        var gap = est.UsedFallback ? 1000f + (seals[i].Center - seals[j].Center).Length() : est.RayGap;
+                        if (gap < best.gap)
+                        {
+                            best = (i, j, gap);
+                        }
+                    }
+                }
+                if (best.i < 0)
+                {
+                    break;
+                }
+                partner[best.i] = best.j;
+                partner[best.j] = best.i;
+                pairs.Add(new(Math.Min(best.i, best.j), Math.Max(best.i, best.j), -1, (seals[best.i].Center - seals[best.j].Center).Length(), best.gap < 1000f ? "room" : "room (midpoint)", bossAreas[group.Key].WorldBounds.Center, true));
+                members.Remove(best.i);
+                members.Remove(best.j);
+            }
+        }
+        // (2) seals still free: the closest other free seal whose inward rays meet (a room the map ranges do not mark); never across two
+        // different boss areas
+        for (var i = 0; i < n; ++i)
+        {
+            if (partner[i] >= 0 || duplicateOf[i] >= 0)
+            {
+                continue;
+            }
+            var best = (j: -1, gap: float.MaxValue, d: 0f);
+            for (var j = 0; j < n; ++j)
+            {
+                if (j == i || partner[j] >= 0 || duplicateOf[j] >= 0 || areaOf[i] >= 0 && areaOf[j] >= 0 && areaOf[i] != areaOf[j])
                 {
                     continue;
                 }
-                var d = (markers[m].Position - seals[i].Center).Length();
-                if (d <= s.SealPairMaxDistance && d >= 0.5f)
+                var d = (seals[j].Center - seals[i].Center).Length();
+                if (d > s.SealPairMaxDistance || d < 4f)
                 {
-                    pairs.Add(new(i, -1, m, d, "seal + exit"));
+                    continue;
+                }
+                var est = TwoRays(new(i, j, -1, d, "seals"), seals[i], seals[j]);
+                if (!est.UsedFallback && est.RayGap < 8f && est.RayGap + d * 0.05f < best.gap)
+                {
+                    best = (j, est.RayGap + d * 0.05f, d);
+                }
+            }
+            if (best.j >= 0)
+            {
+                partner[i] = best.j;
+                partner[best.j] = i;
+                pairs.Add(new(Math.Min(i, best.j), Math.Max(i, best.j), -1, best.d, "seals"));
+            }
+        }
+        // (3) the rest pair with a node on their inward side, else stay single facing their room
+        var nodes = PairNodes(scene, model);
+        for (var i = 0; i < n; ++i)
+        {
+            if (partner[i] >= 0 || duplicateOf[i] >= 0)
+            {
+                continue;
+            }
+            var seal = seals[i];
+            var inward = areaOf[i] >= 0 ? bossAreas[areaOf[i]].WorldBounds.Center - seal.Center : Vector3.Zero;
+            var best = (m: -1, d: float.MaxValue, kind: "", pos: Vector3.Zero);
+            foreach (var (m, pos, kind) in nodes)
+            {
+                var d = (pos - seal.Center).Length();
+                if (d > s.SealPairMaxDistance || d < 0.5f)
+                {
+                    continue;
+                }
+                // known room side: the node must be on it
+                if (inward != Vector3.Zero && Vector3.Dot(new Vector3(inward.X, 0f, inward.Z), new Vector3(pos.X - seal.Center.X, 0f, pos.Z - seal.Center.Z)) < 0f)
+                {
+                    continue;
+                }
+                if (d < best.d)
+                {
+                    best = (m, d, kind, pos);
+                }
+            }
+            if (best.m >= 0)
+            {
+                pairs.Add(new(i, -1, best.m, best.d, $"seal + {best.kind}", best.pos));
+            }
+            else
+            {
+                pairs.Add(new(i, -1, -1, 0f, areaOf[i] >= 0 ? "single seal (room known)" : "single seal", areaOf[i] >= 0 ? bossAreas[areaOf[i]].WorldBounds.Center : default));
+            }
+        }
+        // duplicates face wherever their door's first box faces
+        for (var i = 0; i < n; ++i)
+        {
+            if (duplicateOf[i] < 0)
+            {
+                continue;
+            }
+            var p = pairs.Find(x => x.SealA == duplicateOf[i] || x.SealB == duplicateOf[i]);
+            var target = p.SealB >= 0 ? seals[p.SealA == duplicateOf[i] ? p.SealB : p.SealA].Center : p.HasTarget ? p.Target : default;
+            pairs.Add(new(i, -1, -1, 0f, $"duplicate of seal {duplicateOf[i]}", target));
+        }
+        if (overrides != null && overrides.Count > 0)
+        {
+            ApplyOverrides(pairs, seals, scene, nodes, overrides, areaOf, bossAreas);
+        }
+        pairs.Sort((a, b) => a.SealA.CompareTo(b.SealA));
+        return pairs;
+    }
+
+    // the nodes a seal may pair with: warps and the exit gate (actor positions), player pop points, replay-confirmed landings, exit ranges
+    public static List<(int marker, Vector3 pos, string kind)> PairNodes(ZoneCollisionScene scene, ZoneSceneModel model)
+    {
+        List<(int, Vector3, string)> r = [];
+        foreach (var eo in model.EventObjects)
+        {
+            if (eo.Role is ZoneObjectRole.Warp or ZoneObjectRole.Exit or ZoneObjectRole.Shortcut && eo.MarkerIndex >= 0)
+            {
+                r.Add((eo.MarkerIndex, eo.ActorPosition, eo.Role == ZoneObjectRole.Exit ? "exit gate" : eo.Role == ZoneObjectRole.Shortcut ? "shortcut" : "warp"));
+            }
+        }
+        foreach (var p in model.PopPoints)
+        {
+            if (p.PopType == LgbPopType.Pc && p.MarkerIndex >= 0)
+            {
+                r.Add((p.MarkerIndex, p.Position, "pop point"));
+            }
+        }
+        for (var m = 0; m < scene.Markers.Count; ++m)
+        {
+            if (scene.Markers[m].Type == (int)LgbInstanceType.ExitRange)
+            {
+                r.Add((m, scene.Markers[m].Position, "exit range"));
+            }
+        }
+        return r;
+    }
+
+    public static ulong SealPathId(ZoneCollisionScene scene, in SealCandidate seal)
+    {
+        var node = scene.Boxes[seal.BoxIndex].NodeIndex;
+        return node >= 0 ? scene.Nodes[node].PathId : scene.Boxes[seal.BoxIndex].LayoutObjectId;
+    }
+
+    public static ulong MarkerPathId(ZoneCollisionScene scene, int marker)
+    {
+        var node = scene.Markers[marker].NodeIndex;
+        return node >= 0 ? scene.Nodes[node].PathId : scene.Markers[marker].LayoutObjectId;
+    }
+
+    private static void ApplyOverrides(List<SealPair> pairs, List<SealCandidate> seals, ZoneCollisionScene scene, List<(int marker, Vector3 pos, string kind)> nodes, IReadOnlyList<PairOverride> overrides, int[] areaOf, List<ZoneMapArea> bossAreas)
+    {
+        int SealBy(ulong pathId) => seals.FindIndex(x => SealPathId(scene, x) == pathId);
+        void Detach(int seal)
+        {
+            for (var k = pairs.Count - 1; k >= 0; --k)
+            {
+                var p = pairs[k];
+                if (p.SealA == seal || p.SealB == seal)
+                {
+                    pairs.RemoveAt(k);
+                    var other = p.SealA == seal ? p.SealB : p.SealA;
+                    if (other >= 0)
+                    {
+                        pairs.Add(new(other, -1, -1, 0f, areaOf[other] >= 0 ? "single seal (room known)" : "single seal", areaOf[other] >= 0 ? bossAreas[areaOf[other]].WorldBounds.Center : default));
+                    }
                 }
             }
         }
-        for (var i = 0; i < seals.Count; ++i)
+        foreach (var o in overrides)
         {
-            pairs.Add(new(i, -1, -1, 0f, "single seal"));
+            var i = SealBy(o.SealPathId);
+            if (i < 0)
+            {
+                continue;
+            }
+            Detach(i);
+            if (o.PartnerPathId == 0)
+            {
+                pairs.Add(new(i, -1, -1, 0f, "manual: single", areaOf[i] >= 0 ? bossAreas[areaOf[i]].WorldBounds.Center : default));
+            }
+            else if (!o.PartnerIsNode)
+            {
+                var j = SealBy(o.PartnerPathId);
+                if (j < 0 || j == i)
+                {
+                    continue;
+                }
+                Detach(j);
+                pairs.Add(new(Math.Min(i, j), Math.Max(i, j), -1, (seals[i].Center - seals[j].Center).Length(), "manual: seals"));
+            }
+            else
+            {
+                var node = nodes.Find(x => MarkerPathId(scene, x.marker) == o.PartnerPathId);
+                if (node.kind.Length == 0)
+                {
+                    continue;
+                }
+                pairs.Add(new(i, -1, node.marker, (node.pos - seals[i].Center).Length(), $"manual: seal + {node.kind}", node.pos));
+            }
         }
-        return pairs;
+    }
+
+    // the seal's thin axis in XZ, zero when the box lies flat (a hatch, a filter-off cube): no inward direction to estimate from
+    private static Vector2 InwardXZ(in Vector3 thinAxis)
+    {
+        var d = new Vector2(thinAxis.X, thinAxis.Z);
+        return d.LengthSquared() < 1e-3f * 1e-3f ? Vector2.Zero : Vector2.Normalize(d);
     }
 
     public static CentreEstimate EstimateCentre(in SealPair pair, List<SealCandidate> seals, List<ZoneMarker> markers, AutoMapSettings s, Vector3? preferNear)
     {
         if (pair.SealA < 0 || pair.SealA >= seals.Count)
         {
-            return new(preferNear ?? Vector3.Zero, -1, -1, -1, 0f, true, "no seals");
+            return new(preferNear ?? Vector3.Zero, -1, -1, -1, 0f, true, "no seals", true);
         }
         var a = seals[pair.SealA];
         if (pair.SealB >= 0 && pair.SealB < seals.Count)
@@ -549,17 +1288,30 @@ public static class ArenaAutoMapper
         var d = a.ThinAxisWorld;
         if (pair.MarkerIndex >= 0 && pair.MarkerIndex < markers.Count)
         {
-            // foot of the perpendicular from the marker onto the seal's inward ray, capped to the pair distance
-            var target = markers[pair.MarkerIndex].Position;
+            // foot of the perpendicular from the node onto the seal's inward ray, capped to the pair distance
+            var target = pair.HasTarget ? pair.Target : markers[pair.MarkerIndex].Position;
             if (Vector3.Dot(d, target - a.Center) < 0f)
             {
                 d = -d;
             }
-            var dxz = Vector2.Normalize(new(d.X, d.Z));
+            var dxz = InwardXZ(d);
+            if (dxz == Vector2.Zero)
+            {
+                return new(a.Center, pair.SealA, -1, pair.MarkerIndex, 0f, true, "seal lies flat - seal centre");
+            }
             var w = new Vector2(target.X - a.Center.X, target.Z - a.Center.Z);
             var t = Math.Clamp(Vector2.Dot(w, dxz), 0f, w.Length());
             var c = new Vector2(a.Center.X, a.Center.Z) + dxz * (t * 0.5f);
-            return new(new(c.X, (a.Center.Y + target.Y) * 0.5f, c.Y), pair.SealA, -1, pair.MarkerIndex, 0f, false, "seal + exit range");
+            return new(new(c.X, (a.Center.Y + target.Y) * 0.5f, c.Y), pair.SealA, -1, pair.MarkerIndex, 0f, false, pair.Kind);
+        }
+        if (pair.HasTarget)
+        {
+            // the seal's room is known from the map ranges: face it
+            if (Vector3.Dot(d, pair.Target - a.Center) < 0f)
+            {
+                d = -d;
+            }
+            return new(a.Center + d * (s.MaxRadius * 0.5f), pair.SealA, -1, -1, 0f, false, "single seal facing its room");
         }
         if (preferNear is { } pn && Vector3.Dot(d, pn - a.Center) < 0f)
         {
@@ -584,8 +1336,14 @@ public static class ArenaAutoMapper
         }
         var pi = new Vector2(ci.X, ci.Z);
         var pj = new Vector2(cj.X, cj.Z);
-        var ei = Vector2.Normalize(new(di.X, di.Z));
-        var ej = Vector2.Normalize(new(dj.X, dj.Z));
+        var y = (ci.Y + cj.Y) * 0.5f;
+        var ei = InwardXZ(di);
+        var ej = InwardXZ(dj);
+        if (ei == Vector2.Zero || ej == Vector2.Zero)
+        {
+            var flat = (pi + pj) * 0.5f;
+            return new(new(flat.X, y, flat.Y), pair.SealA, pair.SealB, -1, 0f, true, "seal lies flat - midpoint");
+        }
         var w = pi - pj;
         var a = Vector2.Dot(ei, ei);
         var b = Vector2.Dot(ei, ej);
@@ -593,11 +1351,16 @@ public static class ArenaAutoMapper
         var d = Vector2.Dot(ei, w);
         var e = Vector2.Dot(ej, w);
         var denom = a * c - b * b;
-        var y = (ci.Y + cj.Y) * 0.5f;
         if (MathF.Abs(b) > 0.99f || MathF.Abs(denom) < 1e-4f)
         {
+            // two doors on opposite walls face each other with parallel rays: the room is between them when the doors line up
             var mid = (pi + pj) * 0.5f;
-            return new(new(mid.X, y, mid.Y), pair.SealA, pair.SealB, -1, 0f, true, "rays parallel - midpoint");
+            var offset = MathF.Abs(ei.X * w.Y - ei.Y * w.X);
+            if (offset <= 10f)
+            {
+                return new(new(mid.X, y, mid.Y), pair.SealA, pair.SealB, -1, offset, false, "facing doors - midpoint");
+            }
+            return new(new(mid.X, y, mid.Y), pair.SealA, pair.SealB, -1, offset, true, "rays parallel - midpoint");
         }
         var t = (b * e - c * d) / denom;
         var u = (a * e - b * d) / denom;
@@ -612,58 +1375,79 @@ public static class ArenaAutoMapper
         return new(new(centre.X, y, centre.Y), pair.SealA, pair.SealB, -1, (qi - qj).Length(), false, "ray intersection");
     }
 
+    // the candidate under (x, z) whose surface is nearest to y in height, or within maxDy when given; -1 when none contains the point
+    private struct SeedUnder(ZoneTriangleStore store, float x, float z, float y, float maxDy) : ITriangleVisitor
+    {
+        public int Best = -1;
+        public float BestDy = maxDy;
+
+        public void Visit(int g)
+        {
+            ref readonly var t = ref store[g];
+            if (!t.ContainsXZ(x, z))
+            {
+                return;
+            }
+            var dy = MathF.Abs(t.YAt(x, z) - y);
+            if (dy < BestDy)
+            {
+                BestDy = dy;
+                Best = g;
+            }
+        }
+    }
+
+    // the candidate whose centroid is nearest to (x, z) within the radius
+    private struct SeedNear(ZoneTriangleStore store, float x, float z, float radius) : ITriangleVisitor
+    {
+        public int Best = -1;
+        public float BestD2 = radius * radius;
+
+        public void Visit(int g)
+        {
+            var c = store[g].Centroid;
+            var dx = c.X - x;
+            var dz = c.Z - z;
+            var d = dx * dx + dz * dz;
+            if (d < BestD2)
+            {
+                BestD2 = d;
+                Best = g;
+            }
+        }
+    }
+
+    // the grid triangle under p in XZ whose surface is nearest to p's height, within maxDy; -1 when none
+    public static int TriangleUnder(ZoneCollisionScene scene, TriangleGrid grid, in Vector3 p, float maxDy)
+    {
+        var under = new SeedUnder(scene.Triangles, p.X, p.Z, p.Y, maxDy);
+        grid.ForEachInRect(p.X, p.Z, p.X, p.Z, null, ref under);
+        return under.Best;
+    }
+
     public static int FindSeed(ZoneCollisionScene scene, TriangleAdjacency adj, in Vector3 centre, AutoMapSettings s)
     {
-        var tris = scene.Triangles.Span;
-        var best = -1;
-        var bestDy = float.MaxValue;
-        var n = adj.Candidates.Length;
-        for (var i = 0; i < n; ++i)
+        if (adj.CandidateGrid == null)
         {
-            ref readonly var t = ref tris[adj.Candidates[i]];
-            if (!t.ContainsXZ(centre.X, centre.Z))
-            {
-                continue;
-            }
-            var dy = MathF.Abs(t.YAt(centre.X, centre.Z) - centre.Y);
-            if (dy < bestDy)
-            {
-                bestDy = dy;
-                best = adj.Candidates[i];
-            }
+            return -1;
         }
-        if (best >= 0)
+        var under = TriangleUnder(scene, adj.CandidateGrid, centre, float.MaxValue);
+        if (under >= 0)
         {
-            return best;
+            return under;
         }
-        var bestD = s.SeedSearchRadius * s.SeedSearchRadius;
-        for (var i = 0; i < n; ++i)
-        {
-            ref readonly var t = ref tris[adj.Candidates[i]];
-            var c = t.Centroid;
-            var dx = c.X - centre.X;
-            var dz = c.Z - centre.Z;
-            var d = dx * dx + dz * dz;
-            if (d < bestD)
-            {
-                bestD = d;
-                best = adj.Candidates[i];
-            }
-        }
-        return best;
+        var r = s.SeedSearchRadius;
+        var near = new SeedNear(scene.Triangles, centre.X, centre.Z, r);
+        adj.CandidateGrid.ForEachInRect(centre.X - r, centre.Z - r, centre.X + r, centre.Z + r, null, ref near);
+        return near.Best;
     }
 
     public static bool InsideSeal(in Vector3 p, List<SealCandidate> seals, IReadOnlySet<int> active, long scale)
     {
-        var pt = new Point64((long)Math.Round(p.X * scale), (long)Math.Round(p.Z * scale));
+        var pt = TrianglePolygonBuilder.ToP64(p, scale);
         for (var i = 0; i < seals.Count; ++i)
         {
-            if (!active.Contains(seals[i].BoxIndex))
-            {
-                continue;
-            }
-            var poly = seals[i].InflatedFootprintXZ;
-            if (poly.Count >= 3 && Clipper.PointInPolygon(pt, poly) != PointInPolygonResult.IsOutside)
+            if (active.Contains(seals[i].BoxIndex) && BoxFootprintOps.Contains(seals[i].InflatedFootprintXZ, pt))
             {
                 return true;
             }
@@ -682,12 +1466,11 @@ public static class ArenaAutoMapper
             {
                 continue;
             }
-            var n = new Vector2(seal.ThinAxisWorld.X, seal.ThinAxisWorld.Z);
-            if (n.LengthSquared() < 1e-6f)
+            var n = InwardXZ(seal.ThinAxisWorld);
+            if (n == Vector2.Zero)
             {
                 continue;
             }
-            n = Vector2.Normalize(n);
             var c = new Vector2(seal.Center.X, seal.Center.Z);
             if (Vector2.Dot(n, new Vector2(centre.X, centre.Z) - c) < 0f)
             {
@@ -717,165 +1500,166 @@ public static class ArenaAutoMapper
         return false;
     }
 
-    public static AutoMapResult FloodFill(ZoneCollisionScene scene, TriangleAdjacency adj, int seed, List<SealCandidate> seals, IReadOnlySet<int> activeSeals, in Vector3 centre, AutoMapSettings s)
+    public static AutoMapResult FloodFill(ZoneCollisionScene scene, TriangleAdjacency adj, int seed, List<SealCandidate> seals, IReadOnlySet<int> activeSeals, in Vector3 centre, AutoMapSettings s, CancellationToken ct = default)
+        => FloodFill(scene, adj, seed >= 0 ? [seed] : [], seals, activeSeals, centre, s, ct);
+
+    // takes every reachable node except triangles a seal blocks
+    private struct FillVisitor(ZoneCollisionScene scene, TriangleAdjacency adj, List<SealCandidate> seals, IReadOnlySet<int> activeSeals, Vector3 centre, AutoMapSettings s, List<int> selected, List<int> selectedBoxes) : IWalkVisitor
+    {
+        private readonly long _scale = BoxFootprintOps.DefaultScale;
+        public int Blocked;
+
+        public bool Enter(int node, int depth)
+        {
+            if (adj.IsBoxNode(node))
+            {
+                selectedBoxes.Add(adj.FloorBoxes[node - adj.Candidates.Length]);
+                return true;
+            }
+            var g = adj.Candidates[node];
+            if (depth > 0)
+            {
+                ref readonly var t = ref scene.Triangles[g];
+                var blockedBySeal = s.SealBlock switch
+                {
+                    SealBlockMode.Centroid => InsideSeal(t.Centroid, seals, activeSeals, _scale),
+                    SealBlockMode.AnyVertex => InsideSeal(t.A, seals, activeSeals, _scale) || InsideSeal(t.B, seals, activeSeals, _scale) || InsideSeal(t.C, seals, activeSeals, _scale),
+                    _ => BehindSeal(t, seals, activeSeals, centre, s.SealBehindDepth),
+                };
+                if (blockedBySeal)
+                {
+                    ++Blocked;
+                    return false;
+                }
+            }
+            selected.Add(g);
+            return true;
+        }
+    }
+
+    // several seeds: every triangle the player stood on starts the fill (a path through a dungeon segment)
+    public static AutoMapResult FloodFill(ZoneCollisionScene scene, TriangleAdjacency adj, ReadOnlySpan<int> seeds, List<SealCandidate> seals, IReadOnlySet<int> activeSeals, in Vector3 centre, AutoMapSettings s, CancellationToken ct = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var result = new AutoMapResult { Centre = centre, SeedTriangle = seed, AdjacencyMs = adj.BuildMs };
-        if (seed < 0 || !adj.GlobalToLocal.TryGetValue(seed, out var seedLocal))
+        var result = new AutoMapResult { Centre = centre };
+        var local = new List<int>(seeds.Length);
+        foreach (var seed in seeds)
         {
-            result.Status = "no floor triangle at the centre";
+            var l = adj.LocalOf(seed);
+            if (l >= 0)
+            {
+                local.Add(l);
+            }
+        }
+        if (local.Count == 0)
+        {
+            result.Status = seeds.Length <= 1 ? "no floor triangle at the centre" : "no floor triangle under the path";
             return result;
         }
-        var tris = scene.Triangles.Span;
-        var nodeCount = adj.NodeCount;
-        var visited = new bool[nodeCount];
-        var queue = new int[nodeCount];
-        var head = 0;
-        var tail = 0;
         List<int> selected = [];
         List<int> selectedBoxes = [];
-        List<int> blocked = [];
-        visited[seedLocal] = true;
-        queue[tail++] = seedLocal;
-        var scale = BoxFootprintOps.DefaultScale;
-        while (head < tail)
+        var visitor = new FillVisitor(scene, adj, seals, activeSeals, centre, s, selected, selectedBoxes);
+        adj.Walk(CollectionsMarshal.AsSpan(local), int.MaxValue, ref visitor, ct);
+        result.Selected = [.. selected];
+        result.SelectedBoxes = [.. selectedBoxes];
+        result.FillMs = sw.ElapsedMilliseconds;
+        result.Status = $"filled {selected.Count} triangles and {selectedBoxes.Count} floor box(es) from {adj.Candidates.Length} candidates{(seeds.Length > 1 ? $" and {seeds.Length} path seeds" : "")}, {visitor.Blocked} blocked by seals{(adj.GapLinks > 0 ? $", {adj.GapLinks} gap links" : "")}{(adj.ForcedLinks > 0 ? $", {adj.ForcedLinks} walked links" : "")}";
+        return result;
+    }
+
+    // unselected, non-walkable triangles in the floor's XZ range and height band: their outlines as obstacle strips, rim triangles apart
+    private struct ObstacleCollector(ZoneCollisionScene scene, FloorSelection floor, AutoMapSettings s, IReadOnlySet<int>? rimTriangles, float bandMin, float bandMax, long scale, Paths64 edges, List<float> edgeBase, Paths64 rimEdges) : ITriangleVisitor
+    {
+        private readonly float _minNormalY = s.MinNormalY;
+        private readonly Bounds3 _fb = floor.Bounds;
+        public int ObstacleTriangles;
+
+        public void Visit(int i)
         {
-            var cur = queue[head++];
-            if (adj.IsBoxNode(cur))
+            ref readonly var t = ref scene.Triangles[i];
+            var walkable = floor.Contains(i) || (t.NormalY >= _minNormalY && s.FloorMatches(t));
+            if (walkable)
             {
-                selectedBoxes.Add(adj.FloorBoxes[cur - adj.Candidates.Length]);
+                return;
+            }
+            var b = t.Bounds;
+            if (!TriangleAdjacency.OverlapsBox(b, _fb.Min.X, _fb.Min.Z, _fb.Max.X, _fb.Max.Z, bandMin, bandMax))
+            {
+                return;
+            }
+            if (b.Max.Y - b.Min.Y < s.ObstacleMinHeight)
+            {
+                return; // decal, low step, the side face of a raised plate
+            }
+            if (s.ObstacleLocalHeight)
+            {
+                if (!floor.Overlaps(b, s.ObstacleHeightBelow, s.ObstacleHeightAbove, out var floorTop))
+                {
+                    return; // no selected floor at this height below/around the triangle
+                }
+                if (b.Max.Y <= floorTop + s.StepHeight)
+                {
+                    return; // does not rise above the step height over the floor next to it (kerb, plate edge)
+                }
+            }
+            ++ObstacleTriangles;
+            var pa = TrianglePolygonBuilder.ToP64(t.A, scale);
+            var pb = TrianglePolygonBuilder.ToP64(t.B, scale);
+            var pc = TrianglePolygonBuilder.ToP64(t.C, scale);
+            // closed outline as an open path so zero-area (vertical) triangles still become strips
+            if (rimTriangles != null && rimTriangles.Contains(i))
+            {
+                rimEdges.Add([pa, pb, pc, pa]);
             }
             else
             {
-                selected.Add(adj.Candidates[cur]);
-            }
-            foreach (var nb in adj.NeighboursOf(cur))
-            {
-                if (visited[nb])
-                {
-                    continue;
-                }
-                visited[nb] = true;
-                if (!adj.IsBoxNode(nb))
-                {
-                    ref readonly var t = ref tris[adj.Candidates[nb]];
-                    var blockedBySeal = s.SealBlock switch
-                    {
-                        SealBlockMode.Centroid => InsideSeal(t.Centroid, seals, activeSeals, scale),
-                        SealBlockMode.AnyVertex => InsideSeal(t.A, seals, activeSeals, scale) || InsideSeal(t.B, seals, activeSeals, scale) || InsideSeal(t.C, seals, activeSeals, scale),
-                        _ => BehindSeal(t, seals, activeSeals, centre, s.SealBehindDepth),
-                    };
-                    if (blockedBySeal)
-                    {
-                        blocked.Add(adj.Candidates[nb]);
-                        continue;
-                    }
-                }
-                queue[tail++] = nb;
+                edges.Add([pa, pb, pc, pa]);
+                edgeBase.Add(b.Min.Y);
             }
         }
-        result.Selected = [.. selected];
-        result.SelectedBoxes = [.. selectedBoxes];
-        result.BlockedBySeal = [.. blocked];
-        result.FillMs = sw.ElapsedMilliseconds;
-        result.Status = $"filled {selected.Count} triangles and {selectedBoxes.Count} floor box(es) from {adj.Candidates.Length} candidates, {blocked.Count} blocked by seals";
-        return result;
     }
 
     // XZ footprints of non-walkable triangles near the selection (walls, props, steep faces) as inflated strips, for cutting the floor polygon
     // selected triangles are floor by definition and never cut; meshes marked as floor or excluded never cut either
-    public static Paths64 ObstacleFootprints(ZoneCollisionScene scene, ReadOnlySpan<int> floorTriangles, AutoMapSettings s, out int obstacleTriangles, IReadOnlySet<int>? excludedMeshes = null, IReadOnlySet<int>? floorMeshes = null, IReadOnlySet<int>? rimTriangles = null, Paths64? rimBand = null)
+    public static Paths64 ObstacleFootprints(ZoneCollisionScene scene, FloorSelection floor, AutoMapSettings s, out int obstacleTriangles, IReadOnlySet<int>? excludedMeshes = null, IReadOnlySet<int>? floorMeshes = null, IReadOnlySet<int>? rimTriangles = null, Paths64? rimBand = null, CancellationToken ct = default)
     {
         obstacleTriangles = 0;
-        var tris = scene.Triangles.Span;
-        HashSet<int> selected = new(floorTriangles.Length);
-        for (var i = 0; i < floorTriangles.Length; ++i)
+        if (floor.Count == 0)
         {
-            selected.Add(floorTriangles[i]);
+            return [];
         }
         // rim slopes are walkable inside the rim band (up to the wall) but stay obstacles outside it, so a slope that also
         // covers a leaked part of the fill keeps carving it there
         var rimEdges = new Paths64();
-        var floorMinY = float.MaxValue;
-        var floorMaxY = float.MinValue;
-        var minX = float.MaxValue;
-        var minZ = float.MaxValue;
-        var maxX = float.MinValue;
-        var maxZ = float.MinValue;
-        for (var i = 0; i < floorTriangles.Length; ++i)
-        {
-            var b = tris[floorTriangles[i]].Bounds;
-            floorMinY = MathF.Min(floorMinY, b.Min.Y);
-            floorMaxY = MathF.Max(floorMaxY, b.Max.Y);
-            minX = MathF.Min(minX, b.Min.X);
-            minZ = MathF.Min(minZ, b.Min.Z);
-            maxX = MathF.Max(maxX, b.Max.X);
-            maxZ = MathF.Max(maxZ, b.Max.Z);
-        }
-        if (floorTriangles.Length == 0)
-        {
-            return [];
-        }
-        var bandMin = floorMinY - s.ObstacleHeightBelow;
-        var bandMax = floorMaxY + s.ObstacleHeightAbove;
+        var fb = floor.Bounds;
+        var bandMin = fb.Min.Y - s.ObstacleHeightBelow;
+        var bandMax = fb.Max.Y + s.ObstacleHeightAbove;
         // the height band is evaluated against the floor directly under each obstacle, not the global floor range:
         // a multi-level room (bridges, upper galleries) would otherwise project geometry from other levels onto the arena
-        var floorGrid = new FloorHeightGrid(tris, floorTriangles, minX, minZ, maxX, maxZ);
         var scale = BoxFootprintOps.DefaultScale;
-        var minNormalY = s.MinNormalY;
         var edges = new Paths64();
-        var meshes = scene.Meshes;
-        for (var m = 0; m < meshes.Count; ++m)
-        {
-            var mesh = meshes[m];
-            var wb = mesh.WorldBounds;
-            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || (excludedMeshes != null && excludedMeshes.Contains(m)) || (floorMeshes != null && floorMeshes.Contains(m)) || wb.Max.X < minX || wb.Min.X > maxX || wb.Max.Z < minZ || wb.Min.Z > maxZ || wb.Max.Y < bandMin || wb.Min.Y > bandMax)
-            {
-                continue;
-            }
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
-            {
-                ref readonly var t = ref tris[i];
-                var walkable = selected.Contains(i) || (t.NormalY >= minNormalY && s.FloorMatches(t));
-                if (walkable)
-                {
-                    continue;
-                }
-                var b = t.Bounds;
-                if (b.Max.Y < bandMin || b.Min.Y > bandMax || b.Max.X < minX || b.Min.X > maxX || b.Max.Z < minZ || b.Min.Z > maxZ)
-                {
-                    continue;
-                }
-                if (b.Max.Y - b.Min.Y < s.ObstacleMinHeight)
-                {
-                    continue; // decal, low step, the side face of a raised plate
-                }
-                if (s.ObstacleLocalHeight)
-                {
-                    if (!floorGrid.Overlaps(b, s.ObstacleHeightBelow, s.ObstacleHeightAbove, out var floorTop))
-                    {
-                        continue; // no selected floor at this height below/around the triangle
-                    }
-                    if (b.Max.Y <= floorTop + s.StepHeight)
-                    {
-                        continue; // does not rise above the step height over the floor next to it (kerb, plate edge)
-                    }
-                }
-                ++obstacleTriangles;
-                var pa = new Point64((long)Math.Round(t.A.X * scale), (long)Math.Round(t.A.Z * scale));
-                var pb = new Point64((long)Math.Round(t.B.X * scale), (long)Math.Round(t.B.Z * scale));
-                var pc = new Point64((long)Math.Round(t.C.X * scale), (long)Math.Round(t.C.Z * scale));
-                // closed outline as an open path so zero-area (vertical) triangles still become strips
-                (rimTriangles != null && rimTriangles.Contains(i) ? rimEdges : edges).Add([pa, pb, pc, pa]);
-            }
-        }
+        List<float> edgeBase = []; // lowest point of each obstacle outline in edges, for the floor-above test
+        var collector = new ObstacleCollector(scene, floor, s, rimTriangles, bandMin, bandMax, scale, edges, edgeBase, rimEdges);
+        TriangleAdjacency.ForEachTriangleOfMeshes(scene, (int m, in Bounds3 wb) => (excludedMeshes == null || !excludedMeshes.Contains(m)) && (floorMeshes == null || !floorMeshes.Contains(m)) && TriangleAdjacency.OverlapsBox(wb, fb.Min.X, fb.Min.Z, fb.Max.X, fb.Max.Z, bandMin, bandMax), ref collector, ct);
+        obstacleTriangles = collector.ObstacleTriangles;
         if (obstacleTriangles > s.ObstacleMaxTriangles)
         {
             return [];
         }
         // joined ends: the outline is offset as a closed polyline with no end caps, so two wall triangles meeting at a corner do not chamfer it
-        var strips = edges.Count > 0 ? Clipper.InflatePaths(edges, s.ObstacleInflate * scale, JoinType.Miter, EndType.Joined) : [];
+        Paths64 strips;
+        if (edges.Count == 0)
+        {
+            strips = [];
+        }
+        else if (s.ObstacleUnderFloor && s.ObstacleLocalHeight)
+        {
+            strips = StripsMinusFloorAbove(scene, floor, edges, edgeBase, s, scale, ct);
+        }
+        else
+        {
+            strips = Clipper.InflatePaths(edges, s.ObstacleInflate * scale, JoinType.Miter, EndType.Joined);
+        }
         if (rimEdges.Count > 0)
         {
             var rimStrips = Clipper.InflatePaths(rimEdges, s.ObstacleInflate * scale, JoinType.Miter, EndType.Joined);
@@ -884,28 +1668,79 @@ public static class ArenaAutoMapper
         return strips;
     }
 
+    // obstacles in 2-yalm height buckets by their base: each bucket's strips lose the area where selected floor runs clearly above that base
+    // (a bridge over rocks, a cliff face beside a plank end), so the surface the player walks on stays in the projection; a wall that rises
+    // through the floor above (its base is at that floor) keeps its full strip. Buckets go from the highest down, so the floor cover of a
+    // bucket is the previous cover plus the floor that came within reach: one union grown incrementally
+    private static Paths64 StripsMinusFloorAbove(ZoneCollisionScene scene, FloorSelection floor, Paths64 edges, List<float> edgeBase, AutoMapSettings s, long scale, CancellationToken ct)
+    {
+        var tris = scene.Triangles.Span;
+        var floorPaths = new (Path64 path, float minY)[floor.Triangles.Length];
+        for (var i = 0; i < floor.Triangles.Length; ++i)
+        {
+            ref readonly var t = ref tris[floor.Triangles[i]];
+            floorPaths[i] = ([TrianglePolygonBuilder.ToP64(t.A, scale), TrianglePolygonBuilder.ToP64(t.B, scale), TrianglePolygonBuilder.ToP64(t.C, scale)], t.Bounds.Min.Y);
+        }
+        Array.Sort(floorPaths, (a, b) => b.minY.CompareTo(a.minY)); // highest first: the cover for a bucket is a prefix
+        var order = new int[edges.Count];
+        var bucketOf = new int[edges.Count];
+        for (var i = 0; i < order.Length; ++i)
+        {
+            order[i] = i;
+            bucketOf[i] = (int)MathF.Floor(edgeBase[i] / 2f);
+        }
+        Array.Sort(order, (a, b) => bucketOf[b].CompareTo(bucketOf[a])); // highest bucket first
+        var result = new Paths64();
+        var inflate = s.ObstacleInflate * scale;
+        var lift = s.StepHeight + 1f; // floor this much above the obstacle's base is another level
+        var covered = 0; // floorPaths prefix already in the cover union
+        Paths64? cover = null;
+        var pending = new Paths64();
+        for (var k = 0; k < order.Length;)
+        {
+            ct.ThrowIfCancellationRequested();
+            var bucket = bucketOf[order[k]];
+            var group = new Paths64();
+            var baseY = float.MaxValue;
+            for (; k < order.Length && bucketOf[order[k]] == bucket; ++k)
+            {
+                group.Add(edges[order[k]]);
+                baseY = MathF.Min(baseY, edgeBase[order[k]]);
+            }
+            var strips = Clipper.InflatePaths(group, inflate, JoinType.Miter, EndType.Joined);
+            var threshold = baseY + lift;
+            pending.Clear();
+            for (; covered < floorPaths.Length && floorPaths[covered].minY > threshold; ++covered)
+            {
+                pending.Add(floorPaths[covered].path);
+            }
+            if (pending.Count > 0)
+            {
+                if (cover != null)
+                {
+                    pending.AddRange(cover);
+                }
+                cover = Clipper.Union(pending, FillRule.NonZero);
+            }
+            if (cover != null)
+            {
+                strips = Clipper.Difference(strips, cover, FillRule.NonZero);
+            }
+            result.AddRange(strips);
+        }
+        return result;
+    }
+
     // box colliders standing on the selected floor (props without a mesh): footprint cut like a mesh obstacle. Seals and floor boxes are handled
     // elsewhere; ignoredBoxes are the ones the author switched off on the canvas
-    public static Paths64 ObstacleBoxFootprints(ZoneCollisionScene scene, ReadOnlySpan<int> floorTriangles, ReadOnlySpan<int> floorBoxes, List<SealCandidate> seals, AutoMapSettings s, out int obstacleBoxes, IReadOnlySet<int>? ignoredBoxes = null)
+    public static Paths64 ObstacleBoxFootprints(ZoneCollisionScene scene, FloorSelection floor, ReadOnlySpan<int> floorBoxes, List<SealCandidate> seals, AutoMapSettings s, out int obstacleBoxes, IReadOnlySet<int>? ignoredBoxes = null)
     {
         obstacleBoxes = 0;
-        if (floorTriangles.Length == 0)
+        if (floor.Count == 0)
         {
             return [];
         }
-        var tris = scene.Triangles.Span;
-        var minX = float.MaxValue;
-        var minZ = float.MaxValue;
-        var maxX = float.MinValue;
-        var maxZ = float.MinValue;
-        for (var i = 0; i < floorTriangles.Length; ++i)
-        {
-            var b = tris[floorTriangles[i]].Bounds;
-            minX = MathF.Min(minX, b.Min.X);
-            minZ = MathF.Min(minZ, b.Min.Z);
-            maxX = MathF.Max(maxX, b.Max.X);
-            maxZ = MathF.Max(maxZ, b.Max.Z);
-        }
+        var fb = floor.Bounds;
         HashSet<int> skip = [];
         for (var i = 0; i < floorBoxes.Length; ++i)
         {
@@ -915,7 +1750,6 @@ public static class ArenaAutoMapper
         {
             skip.Add(seals[i].BoxIndex);
         }
-        var floorGrid = new FloorHeightGrid(tris, floorTriangles, minX, minZ, maxX, maxZ);
         var result = new Paths64();
         for (var b = 0; b < scene.Boxes.Count; ++b)
         {
@@ -925,15 +1759,15 @@ public static class ArenaAutoMapper
                 continue;
             }
             var wb = box.WorldBounds;
-            if (wb.Max.X < minX || wb.Min.X > maxX || wb.Max.Z < minZ || wb.Min.Z > maxZ)
+            if (wb.Max.X < fb.Min.X || wb.Min.X > fb.Max.X || wb.Max.Z < fb.Min.Z || wb.Min.Z > fb.Max.Z)
             {
                 continue;
             }
-            if (!floorGrid.Overlaps(wb, s.ObstacleHeightBelow, s.ObstacleHeightAbove, out var floorTop) || wb.Max.Y <= floorTop + s.StepHeight)
+            if (!floor.Overlaps(wb, s.ObstacleHeightBelow, s.ObstacleHeightAbove, out var floorTop) || wb.Max.Y <= floorTop + s.StepHeight)
             {
                 continue; // no floor under it at this height, or it does not rise above the step height
             }
-            var fp = BoxFootprintOps.BoxFootprint(box.Corners, s.ObstacleInflate);
+            var fp = BoxFootprintOps.Inflate(box.FootprintXZ, s.ObstacleInflate);
             if (fp.Count >= 3)
             {
                 result.Add(fp);
@@ -943,88 +1777,31 @@ public static class ArenaAutoMapper
         return result;
     }
 
-    // 2-yalm XZ grid over the selected floor triangles, answering "is there floor at this height near this bounds"
-    private sealed class FloorHeightGrid
-    {
-        private const float CellSize = 2f;
-        private readonly Dictionary<long, List<int>> _cells = [];
-        private readonly WorldTriangle[] _tris;
-        private readonly float _minX;
-        private readonly float _minZ;
-
-        public FloorHeightGrid(ReadOnlySpan<WorldTriangle> tris, ReadOnlySpan<int> floorTriangles, float minX, float minZ, float maxX, float maxZ)
-        {
-            _tris = tris.ToArray();
-            _minX = minX;
-            _minZ = minZ;
-            for (var i = 0; i < floorTriangles.Length; ++i)
-            {
-                var ti = floorTriangles[i];
-                var b = tris[ti].Bounds;
-                var cx0 = CellX(b.Min.X);
-                var cx1 = CellX(b.Max.X);
-                var cz0 = CellZ(b.Min.Z);
-                var cz1 = CellZ(b.Max.Z);
-                for (var cx = cx0; cx <= cx1; ++cx)
-                {
-                    for (var cz = cz0; cz <= cz1; ++cz)
-                    {
-                        var key = ((long)cx << 32) | (uint)cz;
-                        if (!_cells.TryGetValue(key, out var list))
-                        {
-                            list = [];
-                            _cells[key] = list;
-                        }
-                        list.Add(ti);
-                    }
-                }
-            }
-        }
-
-        private int CellX(float x) => (int)MathF.Floor((x - _minX) / CellSize);
-        private int CellZ(float z) => (int)MathF.Floor((z - _minZ) / CellSize);
-
-        // true when a floor triangle overlaps the bounds in XZ and the obstacle intersects [floorMin - below, floorMax + above];
-        // floorTop = highest such floor triangle's top
-        public bool Overlaps(in Bounds3 b, float below, float above, out float floorTop)
-        {
-            floorTop = float.MinValue;
-            var found = false;
-            var cx0 = CellX(b.Min.X);
-            var cx1 = CellX(b.Max.X);
-            var cz0 = CellZ(b.Min.Z);
-            var cz1 = CellZ(b.Max.Z);
-            for (var cx = cx0; cx <= cx1; ++cx)
-            {
-                for (var cz = cz0; cz <= cz1; ++cz)
-                {
-                    if (!_cells.TryGetValue(((long)cx << 32) | (uint)cz, out var list))
-                    {
-                        continue;
-                    }
-                    for (var i = 0; i < list.Count; ++i)
-                    {
-                        var fb = _tris[list[i]].Bounds;
-                        if (fb.Max.X < b.Min.X || fb.Min.X > b.Max.X || fb.Max.Z < b.Min.Z || fb.Min.Z > b.Max.Z)
-                        {
-                            continue;
-                        }
-                        if (b.Max.Y >= fb.Min.Y - below && b.Min.Y <= fb.Max.Y + above)
-                        {
-                            found = true;
-                            floorTop = MathF.Max(floorTop, fb.Max.Y);
-                        }
-                    }
-                }
-            }
-            return found;
-        }
-    }
-
     private const float RimWallTouchEps = 0.25f; // XZ gap allowed between a rim slope and the wall it reaches
 
-    // XZ distance between two segments (endpoint-to-segment both ways, 0 when they cross)
-    private static float SegmentDistXZ(in Vector3 a0, in Vector3 a1, in Vector3 b0, in Vector3 b1)
+    // XZ parameter of p's projection onto the line a-b (unclamped; 0 for a degenerate segment)
+    private static float ProjectT(in Vector3 p, in Vector3 a, in Vector3 b)
+    {
+        var dx = b.X - a.X;
+        var dz = b.Z - a.Z;
+        var len2 = dx * dx + dz * dz;
+        return len2 > 1e-9f ? ((p.X - a.X) * dx + (p.Z - a.Z) * dz) / len2 : 0f;
+    }
+
+    // squared XZ distance from p to the segment a-b, with the clamped parameter of the nearest point
+    private static (float d2, float t) PointSegmentSqXZ(in Vector3 p, in Vector3 a, in Vector3 b)
+    {
+        var t = Math.Clamp(ProjectT(p, a, b), 0f, 1f);
+        var qx = a.X + t * (b.X - a.X) - p.X;
+        var qz = a.Z + t * (b.Z - a.Z) - p.Z;
+        return (qx * qx + qz * qz, t);
+    }
+
+    private static float DistXZToSegment(in Vector3 p, in Vector3 a, in Vector3 b) => MathF.Sqrt(PointSegmentSqXZ(p, a, b).d2);
+
+    // closest approach of two segments in XZ as a squared distance with the parameters of the closest points: 0 at a proper crossing
+    // (the crossing point on both), else the nearest of the four endpoint-to-segment projections
+    public static (float d2, float ta, float tb) SegmentDistSqXZ(in Vector3 a0, in Vector3 a1, in Vector3 b0, in Vector3 b1)
     {
         var d1 = (a1.X - a0.X) * (b0.Z - a0.Z) - (a1.Z - a0.Z) * (b0.X - a0.X);
         var d2 = (a1.X - a0.X) * (b1.Z - a0.Z) - (a1.Z - a0.Z) * (b1.X - a0.X);
@@ -1032,208 +1809,116 @@ public static class ArenaAutoMapper
         var d4 = (b1.X - b0.X) * (a1.Z - b0.Z) - (b1.Z - b0.Z) * (a1.X - b0.X);
         if (((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f)) && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f)))
         {
-            return 0f;
+            return (0f, d3 / (d3 - d4), d1 / (d1 - d2));
         }
-        return MathF.Min(MathF.Min(DistXZToSegment(a0, b0, b1), DistXZToSegment(a1, b0, b1)), MathF.Min(DistXZToSegment(b0, a0, a1), DistXZToSegment(b1, a0, a1)));
+        var best = PointSegmentSqXZ(a0, b0, b1);
+        var r = (d2: best.d2, ta: 0f, tb: best.t);
+        best = PointSegmentSqXZ(a1, b0, b1);
+        if (best.d2 < r.d2)
+        {
+            r = (best.d2, 1f, best.t);
+        }
+        best = PointSegmentSqXZ(b0, a0, a1);
+        if (best.d2 < r.d2)
+        {
+            r = (best.d2, best.t, 0f);
+        }
+        best = PointSegmentSqXZ(b1, a0, a1);
+        if (best.d2 < r.d2)
+        {
+            r = (best.d2, best.t, 1f);
+        }
+        return r;
     }
 
-    // 2-yalm XZ grid over a list of triangles for proximity queries
-    private sealed class TriangleXZGrid
+    // some wall triangle's edge within eps of one of t's edges in XZ, Y ranges overlapping within yEps and the wall rising at least riseAbove over t's top
+    private struct WallTouch(ZoneTriangleStore store, WorldTriangle t, float eps, float yEps, float riseAbove) : ITriangleVisitor
     {
-        private const float CellSize = 2f;
-        private readonly Dictionary<long, List<int>> _cells = [];
-        private readonly float _minX;
-        private readonly float _minZ;
+        private readonly Bounds3 _b = t.Bounds;
+        private readonly float _eps2 = eps * eps;
+        public bool Found;
 
-        public TriangleXZGrid(ReadOnlySpan<WorldTriangle> tris, List<int> triangles, float minX, float minZ, float maxX, float maxZ)
+        public void Visit(int wi)
         {
-            _minX = minX;
-            _minZ = minZ;
-            for (var i = 0; i < triangles.Count; ++i)
+            if (Found)
             {
-                var ti = triangles[i];
-                var b = tris[ti].Bounds;
-                var cx0 = CellX(MathF.Max(b.Min.X, minX));
-                var cx1 = CellX(MathF.Min(b.Max.X, maxX));
-                var cz0 = CellZ(MathF.Max(b.Min.Z, minZ));
-                var cz1 = CellZ(MathF.Min(b.Max.Z, maxZ));
-                for (var cx = cx0; cx <= cx1; ++cx)
-                {
-                    for (var cz = cz0; cz <= cz1; ++cz)
-                    {
-                        var key = ((long)cx << 32) | (uint)cz;
-                        if (!_cells.TryGetValue(key, out var list))
-                        {
-                            list = [];
-                            _cells[key] = list;
-                        }
-                        list.Add(ti);
-                    }
-                }
+                return;
             }
+            ref readonly var w = ref store[wi];
+            var wb = w.Bounds;
+            if (!TriangleAdjacency.OverlapsBox(wb, _b.Min.X - eps, _b.Min.Z - eps, _b.Max.X + eps, _b.Max.Z + eps, _b.Min.Y - yEps, _b.Max.Y + yEps) || wb.Max.Y < _b.Max.Y + riseAbove)
+            {
+                return;
+            }
+            Found = EdgesTouch(t.A, t.B, w) || EdgesTouch(t.B, t.C, w) || EdgesTouch(t.C, t.A, w);
         }
 
-        private int CellX(float x) => (int)MathF.Floor((x - _minX) / CellSize);
-        private int CellZ(float z) => (int)MathF.Floor((z - _minZ) / CellSize);
-
-        // true when some grid triangle's edge comes within eps of one of t's edges in XZ and their Y ranges overlap within yEps
-        public bool Touches(ReadOnlySpan<WorldTriangle> tris, in WorldTriangle t, float eps, float yEps)
-        {
-            var b = t.Bounds;
-            var cx0 = CellX(b.Min.X - eps);
-            var cx1 = CellX(b.Max.X + eps);
-            var cz0 = CellZ(b.Min.Z - eps);
-            var cz1 = CellZ(b.Max.Z + eps);
-            var seen = new HashSet<int>();
-            for (var cx = cx0; cx <= cx1; ++cx)
-            {
-                for (var cz = cz0; cz <= cz1; ++cz)
-                {
-                    if (!_cells.TryGetValue(((long)cx << 32) | (uint)cz, out var list))
-                    {
-                        continue;
-                    }
-                    for (var i = 0; i < list.Count; ++i)
-                    {
-                        var wi = list[i];
-                        if (!seen.Add(wi))
-                        {
-                            continue;
-                        }
-                        ref readonly var w = ref tris[wi];
-                        var wb = w.Bounds;
-                        if (wb.Max.X < b.Min.X - eps || wb.Min.X > b.Max.X + eps || wb.Max.Z < b.Min.Z - eps || wb.Min.Z > b.Max.Z + eps || wb.Max.Y < b.Min.Y - yEps || wb.Min.Y > b.Max.Y + yEps)
-                        {
-                            continue;
-                        }
-                        if (SegmentDistXZ(t.A, t.B, w.A, w.B) <= eps || SegmentDistXZ(t.A, t.B, w.B, w.C) <= eps || SegmentDistXZ(t.A, t.B, w.C, w.A) <= eps
-                            || SegmentDistXZ(t.B, t.C, w.A, w.B) <= eps || SegmentDistXZ(t.B, t.C, w.B, w.C) <= eps || SegmentDistXZ(t.B, t.C, w.C, w.A) <= eps
-                            || SegmentDistXZ(t.C, t.A, w.A, w.B) <= eps || SegmentDistXZ(t.C, t.A, w.B, w.C) <= eps || SegmentDistXZ(t.C, t.A, w.C, w.A) <= eps)
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
-        }
+        private readonly bool EdgesTouch(in Vector3 a, in Vector3 b, in WorldTriangle w)
+            => SegmentDistSqXZ(a, b, w.A, w.B).d2 <= _eps2 || SegmentDistSqXZ(a, b, w.B, w.C).d2 <= _eps2 || SegmentDistSqXZ(a, b, w.C, w.A).d2 <= _eps2;
     }
 
-    private const long RimCellOffset = 1L << 20;
-    private const ulong RimCellMask = (1UL << 21) - 1;
-
-    private static ulong RimKey(in Vector3 v, float eps)
-        => (((ulong)((long)MathF.Floor(v.X / eps) + RimCellOffset) & RimCellMask) << 42) | (((ulong)((long)MathF.Floor(v.Y / eps) + RimCellOffset) & RimCellMask) << 21) | ((ulong)((long)MathF.Floor(v.Z / eps) + RimCellOffset) & RimCellMask);
-
-    private static ulong EdgeKey(ulong a, ulong b) => a < b ? a * 1000003UL ^ b : b * 1000003UL ^ a;
-
-    private static float DistXZToSegment(in Vector3 p, in Vector3 a, in Vector3 b)
+    // true when some wall triangle's edge comes within eps of one of t's edges in XZ, their Y ranges overlap within yEps and the wall
+    // triangle rises at least riseAbove over t's top: a wall the slope leads up to, not the face of a cliff the slope drops off
+    private static bool TouchesWall(ZoneTriangleStore store, TriangleGrid walls, VisitStamp visited, in WorldTriangle t, float eps, float yEps, float riseAbove)
     {
-        var ax = a.X;
-        var az = a.Z;
-        var dx = b.X - ax;
-        var dz = b.Z - az;
-        var len2 = dx * dx + dz * dz;
-        var t = len2 > 1e-9f ? Math.Clamp(((p.X - ax) * dx + (p.Z - az) * dz) / len2, 0f, 1f) : 0f;
-        var qx = ax + t * dx - p.X;
-        var qz = az + t * dz - p.Z;
-        return MathF.Sqrt(qx * qx + qz * qz);
+        var b = t.Bounds;
+        var touch = new WallTouch(store, t, eps, yEps, riseAbove);
+        walls.ForEachInRect(b.Min.X - eps, b.Min.Z - eps, b.Max.X + eps, b.Max.Z + eps, visited, ref touch);
+        return touch.Found;
     }
 
     // rim extension: steep-but-not-wall triangles adjoining the selection boundary, clipped to a band RimExtension wide around the boundary edges
     private readonly record struct WallSegment(Vector3 A, Vector3 B, int Triangle, float TopY);
 
+    // wall foot segments: the lowest edge of steep unselected triangles near the selection (the top edge of a leaning wall would project inside the room)
+    private struct WallFootCollector(ZoneCollisionScene scene, FloorSelection floor, float wallNormalY, Bounds3 fb, float r, List<WallSegment> walls) : ITriangleVisitor
+    {
+        public void Visit(int i)
+        {
+            ref readonly var t = ref scene.Triangles[i];
+            if (floor.Contains(i) || t.NormalY >= wallNormalY)
+            {
+                return;
+            }
+            var b = t.Bounds;
+            if (!TriangleAdjacency.OverlapsBox(b, fb.Min.X - r, fb.Min.Z - r, fb.Max.X + r, fb.Max.Z + r, fb.Min.Y - 1f, fb.Max.Y + 3f))
+            {
+                return;
+            }
+            var footY = b.Min.Y + 0.5f;
+            AddWallSegment(walls, t.A, t.B, i, b.Max.Y, footY);
+            AddWallSegment(walls, t.B, t.C, i, b.Max.Y, footY);
+            AddWallSegment(walls, t.C, t.A, i, b.Max.Y, footY);
+        }
+    }
+
     // boundary edges of the selection within WallSnap of a wall foot are extended to that wall: the sliver between the edge and the foot line
     // (a steep lip, a hole in the mesh) is unioned in, and the matched foot segments are returned so the final vertices can be snapped onto
     // them exactly. Nothing is added beyond the wall line or sideways past the edge, so the extension cannot leak
-    public static Paths64 WallSnapPaths(ZoneCollisionScene scene, ReadOnlySpan<int> triangles, AutoMapSettings s, IReadOnlySet<int>? excludedMeshes, List<(Vector3 a, Vector3 b)> snapSegments, out int snappedEdges)
+    public static Paths64 WallSnapPaths(ZoneCollisionScene scene, FloorSelection floor, AutoMapSettings s, IReadOnlySet<int>? excludedMeshes, List<(Vector3 a, Vector3 b)> snapSegments, out int snappedEdges, CancellationToken ct = default)
     {
         snappedEdges = 0;
         var r = s.WallSnap;
-        if (r <= 0f || triangles.Length == 0)
+        if (r <= 0f || floor.Count == 0)
         {
             return [];
         }
-        var tris = scene.Triangles.Span;
-        var eps = MathF.Max(s.WeldEps, 1e-4f);
-        HashSet<int> selected = new(triangles.Length);
-        Dictionary<ulong, int> edgeCount = new(triangles.Length * 3);
-        var minX = float.MaxValue;
-        var minZ = float.MaxValue;
-        var maxX = float.MinValue;
-        var maxZ = float.MinValue;
-        var minY = float.MaxValue;
-        var maxY = float.MinValue;
-        for (var i = 0; i < triangles.Length; ++i)
-        {
-            selected.Add(triangles[i]);
-            ref readonly var t = ref tris[triangles[i]];
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            edgeCount[EdgeKey(ka, kb)] = edgeCount.GetValueOrDefault(EdgeKey(ka, kb)) + 1;
-            edgeCount[EdgeKey(kb, kc)] = edgeCount.GetValueOrDefault(EdgeKey(kb, kc)) + 1;
-            edgeCount[EdgeKey(kc, ka)] = edgeCount.GetValueOrDefault(EdgeKey(kc, ka)) + 1;
-            var b = t.Bounds;
-            minX = MathF.Min(minX, b.Min.X);
-            minZ = MathF.Min(minZ, b.Min.Z);
-            maxX = MathF.Max(maxX, b.Max.X);
-            maxZ = MathF.Max(maxZ, b.Max.Z);
-            minY = MathF.Min(minY, b.Min.Y);
-            maxY = MathF.Max(maxY, b.Max.Y);
-        }
-        List<(Vector3 a, Vector3 b)> boundary = [];
-        for (var i = 0; i < triangles.Length; ++i)
-        {
-            ref readonly var t = ref tris[triangles[i]];
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            if (edgeCount[EdgeKey(ka, kb)] == 1) { boundary.Add((t.A, t.B)); }
-            if (edgeCount[EdgeKey(kb, kc)] == 1) { boundary.Add((t.B, t.C)); }
-            if (edgeCount[EdgeKey(kc, ka)] == 1) { boundary.Add((t.C, t.A)); }
-        }
+        var fb = floor.Bounds;
+        var boundary = floor.BoundaryEdges;
         if (boundary.Count == 0)
         {
             return [];
         }
 
-        // wall foot segments: the lowest edge of steep unselected triangles near the selection (the top edge of a leaning wall would project inside the room)
         var wallNormalY = MathF.Cos(s.RimMaxSlopeDeg * MathF.PI / 180f);
         List<WallSegment> walls = [];
-        var meshes = scene.Meshes;
-        for (var m = 0; m < meshes.Count; ++m)
-        {
-            var mesh = meshes[m];
-            var wb = mesh.WorldBounds;
-            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || (excludedMeshes != null && excludedMeshes.Contains(m)) || wb.Max.X < minX - r || wb.Min.X > maxX + r || wb.Max.Z < minZ - r || wb.Min.Z > maxZ + r || wb.Max.Y < minY - 1f || wb.Min.Y > maxY + 3f)
-            {
-                continue;
-            }
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
-            {
-                ref readonly var t = ref tris[i];
-                if (selected.Contains(i) || t.NormalY >= wallNormalY)
-                {
-                    continue;
-                }
-                var b = t.Bounds;
-                if (b.Max.X < minX - r || b.Min.X > maxX + r || b.Max.Z < minZ - r || b.Min.Z > maxZ + r || b.Max.Y < minY - 1f || b.Min.Y > maxY + 3f)
-                {
-                    continue;
-                }
-                var footY = b.Min.Y + 0.5f;
-                AddWallSegment(walls, t.A, t.B, i, b.Max.Y, footY);
-                AddWallSegment(walls, t.B, t.C, i, b.Max.Y, footY);
-                AddWallSegment(walls, t.C, t.A, i, b.Max.Y, footY);
-            }
-        }
+        var collector = new WallFootCollector(scene, floor, wallNormalY, fb, r, walls);
+        TriangleAdjacency.ForEachTriangleOfMeshes(scene, (int m, in Bounds3 wb) => (excludedMeshes == null || !excludedMeshes.Contains(m)) && TriangleAdjacency.OverlapsBox(wb, fb.Min.X - r, fb.Min.Z - r, fb.Max.X + r, fb.Max.Z + r, fb.Min.Y - 1f, fb.Max.Y + 3f), ref collector, ct);
         if (walls.Count == 0)
         {
             return [];
         }
-        var wallGrid = new SegmentGrid(walls, minX - r, minZ - r);
+        var wallGrid = new SegmentGrid(walls.Count, i => (walls[i].A, walls[i].B));
 
         // for every (edge, wall foot) pair within reach: the trapezoid between the edge and its projection on the foot line, clipped to the
         // capsule around the segment so nothing runs along the line past the wall's end; whatever lands beyond a wall line is cut off again
@@ -1242,17 +1927,25 @@ public static class ArenaAutoMapper
         var fill = new Paths64();
         var capsules = new Paths64();
         HashSet<int> usedWalls = [];
-        foreach (var (a, b) in boundary)
+        List<int> near = [];
+        var r2 = r * r;
+        for (var e = 0; e < boundary.Count; ++e)
         {
+            if ((e & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            var (a, b) = boundary[e];
             var edgeMinY = MathF.Min(a.Y, b.Y);
             var edgeMaxY = MathF.Max(a.Y, b.Y);
             var hit = false;
-            foreach (var w in wallGrid.Near(a, b, r))
+            wallGrid.Near(a, b, r, near);
+            foreach (var w in near)
             {
                 var seg = walls[w];
                 var segMinY = MathF.Min(seg.A.Y, seg.B.Y);
                 var segMaxY = MathF.Max(seg.A.Y, seg.B.Y);
-                if (segMaxY < edgeMinY - 0.5f || segMinY > edgeMaxY + 1f || seg.TopY < edgeMaxY + s.StepHeight || SegmentDistXZ(a, b, seg.A, seg.B) > r)
+                if (segMaxY < edgeMinY - 0.5f || segMinY > edgeMaxY + 1f || seg.TopY < edgeMaxY + s.StepHeight || SegmentDistSqXZ(a, b, seg.A, seg.B).d2 > r2)
                 {
                     continue;
                 }
@@ -1262,16 +1955,10 @@ public static class ArenaAutoMapper
                 if (usedWalls.Add(w))
                 {
                     snapSegments.Add((seg.A, seg.B));
-                    capsules.Add([new Point64((long)Math.Round(seg.A.X * scale), (long)Math.Round(seg.A.Z * scale)), new Point64((long)Math.Round(seg.B.X * scale), (long)Math.Round(seg.B.Z * scale))]);
+                    capsules.Add([TrianglePolygonBuilder.ToP64(seg.A, scale), TrianglePolygonBuilder.ToP64(seg.B, scale)]);
                 }
-                var quad = new Path64
-                {
-                    new Point64((long)Math.Round(a.X * scale), (long)Math.Round(a.Z * scale)),
-                    new Point64((long)Math.Round(b.X * scale), (long)Math.Round(b.Z * scale)),
-                    new Point64((long)Math.Round(pb.X * scale), (long)Math.Round(pb.Y * scale)),
-                    new Point64((long)Math.Round(pa.X * scale), (long)Math.Round(pa.Y * scale)),
-                };
-                if (Math.Abs(Clipper.Area(quad)) < 1.0)
+                var quad = new Path64 { TrianglePolygonBuilder.ToP64(a, scale), TrianglePolygonBuilder.ToP64(b, scale), TrianglePolygonBuilder.ToP64(pb, scale), TrianglePolygonBuilder.ToP64(pa, scale) };
+                if (Math.Abs(Clipper.Area(quad)) < 1d)
                 {
                     continue;
                 }
@@ -1304,30 +1991,28 @@ public static class ArenaAutoMapper
         }
     }
 
-    // XZ projection of p onto the segment a-b, clamped to the segment extended by 'ext' at both ends
+    // XZ projection of p onto the segment a-b, clamped to the segment extended by 'ext' at both ends (float.MaxValue = the whole line)
     private static Vector2 ProjectOnSegment(in Vector3 p, in Vector3 a, in Vector3 b, float ext)
     {
-        var ax = a.X;
-        var az = a.Z;
-        var dx = b.X - ax;
-        var dz = b.Z - az;
+        var dx = b.X - a.X;
+        var dz = b.Z - a.Z;
         var len2 = dx * dx + dz * dz;
         if (len2 < 1e-9f)
         {
-            return new(ax, az);
+            return new(a.X, a.Z);
         }
-        var t = ((p.X - ax) * dx + (p.Z - az) * dz) / len2;
+        var t = ProjectT(p, a, b);
         if (ext != float.MaxValue)
         {
             var len = MathF.Sqrt(len2);
             t = Math.Clamp(t, -ext / len, 1f + ext / len);
         }
-        return new(ax + t * dx, az + t * dz);
+        return new(a.X + t * dx, a.Z + t * dz);
     }
 
     // final vertices within tolerance of a matched wall foot are moved onto the foot line (its corner when near an endpoint), so the arena
     // edge carries the wall's own vertices instead of the 'inflate' inset of the obstacle strip
-    public static void SnapVerticesToWalls(List<CollisionOutlinesExtractor.PolygonWithHoles> polys, List<(Vector3 a, Vector3 b)> segments, float tol)
+    public static void SnapVerticesToWalls(List<PolygonWithHoles> polys, List<(Vector3 a, Vector3 b)> segments, float tol)
     {
         if (segments.Count == 0 || tol <= 0f)
         {
@@ -1346,6 +2031,7 @@ public static class ArenaAutoMapper
     private static void SnapContour(List<Vector3> pts, List<(Vector3 a, Vector3 b)> segments, float tol)
     {
         var cornerTol = tol * 2f;
+        var cornerTol2 = cornerTol * cornerTol;
         for (var i = 0; i < pts.Count; ++i)
         {
             var p = pts[i];
@@ -1357,145 +2043,123 @@ public static class ArenaAutoMapper
                 {
                     continue;
                 }
-                var da = MathF.Sqrt((a.X - p.X) * (a.X - p.X) + (a.Z - p.Z) * (a.Z - p.Z));
-                var db = MathF.Sqrt((b.X - p.X) * (b.X - p.X) + (b.Z - p.Z) * (b.Z - p.Z));
-                if (da <= cornerTol && da < best + tol)
+                var da2 = (a.X - p.X) * (a.X - p.X) + (a.Z - p.Z) * (a.Z - p.Z);
+                if (da2 <= cornerTol2)
                 {
-                    best = MathF.Min(best, da);
-                    target = new(a.X, p.Y, a.Z);
-                    continue;
+                    var da = MathF.Sqrt(da2);
+                    if (da < best + tol)
+                    {
+                        best = MathF.Min(best, da);
+                        target = new(a.X, p.Y, a.Z);
+                        continue;
+                    }
                 }
-                if (db <= cornerTol && db < best + tol)
+                var db2 = (b.X - p.X) * (b.X - p.X) + (b.Z - p.Z) * (b.Z - p.Z);
+                if (db2 <= cornerTol2)
                 {
-                    best = MathF.Min(best, db);
-                    target = new(b.X, p.Y, b.Z);
-                    continue;
+                    var db = MathF.Sqrt(db2);
+                    if (db < best + tol)
+                    {
+                        best = MathF.Min(best, db);
+                        target = new(b.X, p.Y, b.Z);
+                        continue;
+                    }
                 }
-                var d = DistXZToSegment(p, a, b);
-                if (d < best)
+                var (d2, t) = PointSegmentSqXZ(p, a, b);
+                if (d2 < best * best)
                 {
-                    best = d;
-                    var q = ProjectOnSegment(p, a, b, 0f);
-                    target = new(q.X, p.Y, q.Y);
+                    best = MathF.Sqrt(d2);
+                    target = new(a.X + t * (b.X - a.X), p.Y, a.Z + t * (b.Z - a.Z));
                 }
             }
             pts[i] = target;
         }
     }
 
-    // 2-yalm XZ grid over wall segments for the boundary-edge matching
+    // 2-yalm XZ grid over segments (wall feet, boundary edges) for the edge-matching passes
     private sealed class SegmentGrid
     {
         private const float CellSize = 2f;
-        private readonly Dictionary<long, List<int>> _cells = [];
-        private readonly float _minX;
-        private readonly float _minZ;
-        private readonly HashSet<int> _seen = [];
+        private readonly XZHashGrid _cells = new(CellSize);
+        private readonly VisitStamp _seen;
 
-        public SegmentGrid(List<WallSegment> walls, float minX, float minZ)
+        public SegmentGrid(int count, Func<int, (Vector3 a, Vector3 b)> segment)
         {
-            _minX = minX;
-            _minZ = minZ;
-            for (var i = 0; i < walls.Count; ++i)
+            _seen = new(count);
+            for (var i = 0; i < count; ++i)
             {
-                var w = walls[i];
-                var cx0 = CellX(MathF.Min(w.A.X, w.B.X));
-                var cx1 = CellX(MathF.Max(w.A.X, w.B.X));
-                var cz0 = CellZ(MathF.Min(w.A.Z, w.B.Z));
-                var cz1 = CellZ(MathF.Max(w.A.Z, w.B.Z));
-                for (var cx = cx0; cx <= cx1; ++cx)
+                var (a, b) = segment(i);
+                _cells.Add(i, MathF.Min(a.X, b.X), MathF.Min(a.Z, b.Z), MathF.Max(a.X, b.X), MathF.Max(a.Z, b.Z));
+            }
+        }
+
+        private struct Collect(VisitStamp seen, List<int> dst) : IRingVisitor
+        {
+            public readonly double BestDistSq => 0d;
+
+            public readonly void Visit(List<int> ids)
+            {
+                foreach (var i in ids)
                 {
-                    for (var cz = cz0; cz <= cz1; ++cz)
+                    if (seen.Visit(i))
                     {
-                        var key = ((long)cx << 32) | (uint)cz;
-                        if (!_cells.TryGetValue(key, out var list))
-                        {
-                            _cells[key] = list = [];
-                        }
-                        list.Add(i);
+                        dst.Add(i);
                     }
                 }
             }
         }
 
-        private int CellX(float x) => (int)MathF.Floor((x - _minX) / CellSize);
-        private int CellZ(float z) => (int)MathF.Floor((z - _minZ) / CellSize);
-
-        public IEnumerable<int> Near(Vector3 a, Vector3 b, float r)
+        // the segments whose cells overlap the rect around a-b grown by r, each once
+        public void Near(in Vector3 a, in Vector3 b, float r, List<int> dst)
         {
-            _seen.Clear();
-            var cx0 = CellX(MathF.Min(a.X, b.X) - r);
-            var cx1 = CellX(MathF.Max(a.X, b.X) + r);
-            var cz0 = CellZ(MathF.Min(a.Z, b.Z) - r);
-            var cz1 = CellZ(MathF.Max(a.Z, b.Z) + r);
-            for (var cx = cx0; cx <= cx1; ++cx)
-            {
-                for (var cz = cz0; cz <= cz1; ++cz)
-                {
-                    if (_cells.TryGetValue(((long)cx << 32) | (uint)cz, out var list))
-                    {
-                        foreach (var i in list)
-                        {
-                            if (_seen.Add(i))
-                            {
-                                yield return i;
-                            }
-                        }
-                    }
-                }
-            }
+            dst.Clear();
+            _seen.Next();
+            var c = new Collect(_seen, dst);
+            _cells.ForEachInRect(MathF.Min(a.X, b.X) - r, MathF.Min(a.Z, b.Z) - r, MathF.Max(a.X, b.X) + r, MathF.Max(a.Z, b.Z) + r, ref c);
         }
     }
 
-    public static Paths64 RimExtensionPaths(ZoneCollisionScene scene, ReadOnlySpan<int> triangles, AutoMapSettings s, IReadOnlySet<int>? excludedMeshes, HashSet<int> rimTriangles, out Paths64 band)
+    // unselected, non-wall triangles near the selection (rim candidates) and the steep ones (the walls a rim chain must reach)
+    private struct RimPoolCollector(ZoneCollisionScene scene, FloorSelection floor, AutoMapSettings s, float minNormalY, Bounds3 fb, float r, List<int> pool, List<int> walls) : ITriangleVisitor
+    {
+        public void Visit(int i)
+        {
+            ref readonly var t = ref scene.Triangles[i];
+            if (floor.Contains(i))
+            {
+                return;
+            }
+            var b = t.Bounds;
+            if (b.Max.X < fb.Min.X - r || b.Min.X > fb.Max.X + r || b.Max.Z < fb.Min.Z - r || b.Min.Z > fb.Max.Z + r)
+            {
+                return;
+            }
+            if (t.NormalY < minNormalY)
+            {
+                if (s.RimRequireWall && b.Max.Y >= fb.Min.Y - 2f && b.Min.Y <= fb.Max.Y + 4f)
+                {
+                    walls.Add(i);
+                }
+                return;
+            }
+            pool.Add(i);
+        }
+    }
+
+    public static Paths64 RimExtensionPaths(ZoneCollisionScene scene, FloorSelection floor, AutoMapSettings s, IReadOnlySet<int>? excludedMeshes, HashSet<int> rimTriangles, out Paths64 band, CancellationToken ct = default)
     {
         band = [];
         rimTriangles.Clear();
-        if (s.RimExtension <= 0f || triangles.Length == 0)
+        if (s.RimExtension <= 0f || floor.Count == 0)
         {
             return [];
         }
         var tris = scene.Triangles.Span;
-        var eps = MathF.Max(s.WeldEps, 1e-4f);
-        HashSet<int> selected = new(triangles.Length);
-        Dictionary<ulong, int> edgeCount = new(triangles.Length * 3);
-        var minX = float.MaxValue;
-        var minZ = float.MaxValue;
-        var maxX = float.MinValue;
-        var maxZ = float.MinValue;
-        var minY = float.MaxValue;
-        var maxY = float.MinValue;
-        for (var i = 0; i < triangles.Length; ++i)
-        {
-            selected.Add(triangles[i]);
-            ref readonly var t = ref tris[triangles[i]];
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            edgeCount[EdgeKey(ka, kb)] = edgeCount.GetValueOrDefault(EdgeKey(ka, kb)) + 1;
-            edgeCount[EdgeKey(kb, kc)] = edgeCount.GetValueOrDefault(EdgeKey(kb, kc)) + 1;
-            edgeCount[EdgeKey(kc, ka)] = edgeCount.GetValueOrDefault(EdgeKey(kc, ka)) + 1;
-            var b = t.Bounds;
-            minX = MathF.Min(minX, b.Min.X);
-            minZ = MathF.Min(minZ, b.Min.Z);
-            maxX = MathF.Max(maxX, b.Max.X);
-            maxZ = MathF.Max(maxZ, b.Max.Z);
-            minY = MathF.Min(minY, b.Min.Y);
-            maxY = MathF.Max(maxY, b.Max.Y);
-        }
-        // boundary edges: shared by exactly one selected triangle
-        List<(Vector3 a, Vector3 b)> boundary = [];
-        HashSet<ulong> boundaryKeys = [];
-        for (var i = 0; i < triangles.Length; ++i)
-        {
-            ref readonly var t = ref tris[triangles[i]];
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            if (edgeCount[EdgeKey(ka, kb)] == 1) { boundary.Add((t.A, t.B)); boundaryKeys.Add(EdgeKey(ka, kb)); }
-            if (edgeCount[EdgeKey(kb, kc)] == 1) { boundary.Add((t.B, t.C)); boundaryKeys.Add(EdgeKey(kb, kc)); }
-            if (edgeCount[EdgeKey(kc, ka)] == 1) { boundary.Add((t.C, t.A)); boundaryKeys.Add(EdgeKey(kc, ka)); }
-        }
+        var eps = floor.WeldEps;
+        var fb = floor.Bounds;
+        // boundary edges: shared by exactly one selected triangle; keys map an edge to the height of its floor edge (the chain's source floor)
+        var boundary = floor.BoundaryEdges;
+        var boundaryKeys = floor.BoundaryKeys;
         if (boundary.Count == 0)
         {
             return [];
@@ -1506,39 +2170,8 @@ public static class ArenaAutoMapper
         var minNormalY = MathF.Cos(s.RimMaxSlopeDeg * MathF.PI / 180f);
         List<int> pool = [];
         List<int> walls = []; // unselected triangles steeper than the rim slope limit (the walls a rim chain must reach)
-        var meshes = scene.Meshes;
-        for (var m = 0; m < meshes.Count; ++m)
-        {
-            var mesh = meshes[m];
-            var wb = mesh.WorldBounds;
-            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || (excludedMeshes != null && excludedMeshes.Contains(m)) || wb.Max.X < minX - r || wb.Min.X > maxX + r || wb.Max.Z < minZ - r || wb.Min.Z > maxZ + r || wb.Max.Y < minY - 2f || wb.Min.Y > maxY + 4f)
-            {
-                continue;
-            }
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
-            {
-                ref readonly var t = ref tris[i];
-                if (selected.Contains(i))
-                {
-                    continue;
-                }
-                var b = t.Bounds;
-                if (b.Max.X < minX - r || b.Min.X > maxX + r || b.Max.Z < minZ - r || b.Min.Z > maxZ + r)
-                {
-                    continue;
-                }
-                if (t.NormalY < minNormalY)
-                {
-                    if (s.RimRequireWall && b.Max.Y >= minY - 2f && b.Min.Y <= maxY + 4f)
-                    {
-                        walls.Add(i);
-                    }
-                    continue;
-                }
-                pool.Add(i);
-            }
-        }
+        var collector = new RimPoolCollector(scene, floor, s, minNormalY, fb, r, pool, walls);
+        TriangleAdjacency.ForEachTriangleOfMeshes(scene, (int m, in Bounds3 wb) => (excludedMeshes == null || !excludedMeshes.Contains(m)) && TriangleAdjacency.OverlapsBox(wb, fb.Min.X - r, fb.Min.Z - r, fb.Max.X + r, fb.Max.Z + r, fb.Min.Y - 2f, fb.Max.Y + 4f), ref collector, ct);
         if (pool.Count == 0)
         {
             return [];
@@ -1549,10 +2182,10 @@ public static class ArenaAutoMapper
         for (var p = 0; p < pool.Count; ++p)
         {
             ref readonly var t = ref tris[pool[p]];
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            foreach (var k in (ReadOnlySpan<ulong>)[EdgeKey(ka, kb), EdgeKey(kb, kc), EdgeKey(kc, ka)])
+            var ka = TriangleAdjacency.WeldKey(t.A, eps);
+            var kb = TriangleAdjacency.WeldKey(t.B, eps);
+            var kc = TriangleAdjacency.WeldKey(t.C, eps);
+            foreach (var k in (ReadOnlySpan<ulong>)[TriangleAdjacency.EdgeKey(ka, kb), TriangleAdjacency.EdgeKey(kb, kc), TriangleAdjacency.EdgeKey(kc, ka)])
             {
                 if (!poolEdges.TryGetValue(k, out var list))
                 {
@@ -1561,19 +2194,45 @@ public static class ArenaAutoMapper
                 list.Add(pool[p]);
             }
         }
+        // the pool triangles sharing an edge with tri, into a reused list
+        List<int> neighbours = [];
+        void EdgeNeighbours(int tri)
+        {
+            neighbours.Clear();
+            ref readonly var t = ref scene.Triangles[tri];
+            var ka = TriangleAdjacency.WeldKey(t.A, eps);
+            var kb = TriangleAdjacency.WeldKey(t.B, eps);
+            var kc = TriangleAdjacency.WeldKey(t.C, eps);
+            foreach (var k in (ReadOnlySpan<ulong>)[TriangleAdjacency.EdgeKey(ka, kb), TriangleAdjacency.EdgeKey(kb, kc), TriangleAdjacency.EdgeKey(kc, ka)])
+            {
+                if (poolEdges.TryGetValue(k, out var list))
+                {
+                    neighbours.AddRange(list);
+                }
+            }
+        }
+        // within r of some boundary edge: the edges near the triangle's bounds are the only ones that can be
+        var boundaryGrid = new SegmentGrid(boundary.Count, i => boundary[i]);
+        List<int> nearEdges = [];
+        var r2 = r * r;
         bool InBand(in WorldTriangle t)
         {
-            var best = float.MaxValue;
+            var b = t.Bounds;
+            boundaryGrid.Near(b.Min, b.Max, r, nearEdges);
             var c = t.Centroid;
-            for (var e = 0; e < boundary.Count && best > r; ++e)
+            foreach (var e in nearEdges)
             {
-                var (a, b) = boundary[e];
-                best = MathF.Min(best, MathF.Min(DistXZToSegment(t.A, a, b), MathF.Min(DistXZToSegment(t.B, a, b), MathF.Min(DistXZToSegment(t.C, a, b), DistXZToSegment(c, a, b)))));
+                var (a, bb) = boundary[e];
+                if (PointSegmentSqXZ(t.A, a, bb).d2 <= r2 || PointSegmentSqXZ(t.B, a, bb).d2 <= r2 || PointSegmentSqXZ(t.C, a, bb).d2 <= r2 || PointSegmentSqXZ(c, a, bb).d2 <= r2)
+                {
+                    return true;
+                }
             }
-            return best <= r;
+            return false;
         }
         Queue<(int tri, int hop)> queue = new();
-        foreach (var k in boundaryKeys)
+        Dictionary<int, float> rootY = []; // rim triangle -> height of the floor edge its chain started from
+        foreach (var (k, floorY) in boundaryKeys)
         {
             if (poolEdges.TryGetValue(k, out var list))
             {
@@ -1581,16 +2240,21 @@ public static class ArenaAutoMapper
                 {
                     if (rimTriangles.Add(tri))
                     {
+                        rootY[tri] = floorY;
                         queue.Enqueue((tri, 1));
                     }
                 }
             }
         }
+        var steps = 0;
         while (queue.Count > 0)
         {
+            if ((++steps & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
             var (tri, hop) = queue.Dequeue();
-            ref readonly var t = ref tris[tri];
-            if (!InBand(t))
+            if (!InBand(tris[tri]))
             {
                 rimTriangles.Remove(tri);
                 continue;
@@ -1599,20 +2263,13 @@ public static class ArenaAutoMapper
             {
                 continue;
             }
-            var ka = RimKey(t.A, eps);
-            var kb = RimKey(t.B, eps);
-            var kc = RimKey(t.C, eps);
-            foreach (var k in (ReadOnlySpan<ulong>)[EdgeKey(ka, kb), EdgeKey(kb, kc), EdgeKey(kc, ka)])
+            EdgeNeighbours(tri);
+            foreach (var next in neighbours)
             {
-                if (poolEdges.TryGetValue(k, out var list))
+                if (rimTriangles.Add(next))
                 {
-                    foreach (var next in list)
-                    {
-                        if (rimTriangles.Add(next))
-                        {
-                            queue.Enqueue((next, hop + 1));
-                        }
-                    }
+                    rootY[next] = rootY[tri];
+                    queue.Enqueue((next, hop + 1));
                 }
             }
         }
@@ -1620,35 +2277,35 @@ public static class ArenaAutoMapper
         {
             // keep only the rim triangles whose chain (through other rim triangles) touches a wall; walls and slopes are
             // usually separate meshes that are not vertex-welded to each other, so touching is geometric (XZ distance + Y overlap)
-            var wallGrid = new TriangleXZGrid(tris, walls, minX - r, minZ - r, maxX + r, maxZ + r);
+            var wallGrid = new TriangleGrid(tris, CollectionsMarshal.AsSpan(walls));
+            var wallVisited = new VisitStamp(scene.Triangles.Count);
             HashSet<int> reached = [];
             Queue<int> back = new();
             foreach (var tri in rimTriangles)
             {
-                if (wallGrid.Touches(tris, tris[tri], RimWallTouchEps, 0.5f))
+                ref readonly var t = ref tris[tri];
+                // a slope that has dropped more than the step height below its source floor edge leads down to the wall: the player
+                // cannot reach that wall from the floor, so the chain is not accepted and the edge stays on the floor vertices
+                if (t.Bounds.Min.Y < rootY[tri] - s.StepHeight)
+                {
+                    continue;
+                }
+                if (TouchesWall(scene.Triangles, wallGrid, wallVisited, t, RimWallTouchEps, 0.5f, s.StepHeight))
                 {
                     reached.Add(tri);
                     back.Enqueue(tri);
                 }
             }
+            ct.ThrowIfCancellationRequested();
             while (back.Count > 0)
             {
                 var tri = back.Dequeue();
-                ref readonly var t = ref tris[tri];
-                var ka = RimKey(t.A, eps);
-                var kb = RimKey(t.B, eps);
-                var kc = RimKey(t.C, eps);
-                foreach (var k in (ReadOnlySpan<ulong>)[EdgeKey(ka, kb), EdgeKey(kb, kc), EdgeKey(kc, ka)])
+                EdgeNeighbours(tri);
+                foreach (var next in neighbours)
                 {
-                    if (poolEdges.TryGetValue(k, out var list))
+                    if (rimTriangles.Contains(next) && reached.Add(next))
                     {
-                        foreach (var next in list)
-                        {
-                            if (rimTriangles.Contains(next) && reached.Add(next))
-                            {
-                                back.Enqueue(next);
-                            }
-                        }
+                        back.Enqueue(next);
                     }
                 }
             }
@@ -1664,17 +2321,14 @@ public static class ArenaAutoMapper
         var edgePaths = new Paths64(boundary.Count);
         foreach (var (a, b) in boundary)
         {
-            edgePaths.Add([new Point64((long)Math.Round(a.X * scale), (long)Math.Round(a.Z * scale)), new Point64((long)Math.Round(b.X * scale), (long)Math.Round(b.Z * scale))]);
+            edgePaths.Add([TrianglePolygonBuilder.ToP64(a, scale), TrianglePolygonBuilder.ToP64(b, scale)]);
         }
         band = Clipper.InflatePaths(edgePaths, r * scale, JoinType.Round, EndType.Round);
         var rimPaths = new Paths64(rimTriangles.Count);
         foreach (var tri in rimTriangles)
         {
             ref readonly var t = ref tris[tri];
-            var pa = new Point64((long)Math.Round(t.A.X * scale), (long)Math.Round(t.A.Z * scale));
-            var pb = new Point64((long)Math.Round(t.B.X * scale), (long)Math.Round(t.B.Z * scale));
-            var pc = new Point64((long)Math.Round(t.C.X * scale), (long)Math.Round(t.C.Z * scale));
-            Path64 path = [pa, pb, pc];
+            Path64 path = [TrianglePolygonBuilder.ToP64(t.A, scale), TrianglePolygonBuilder.ToP64(t.B, scale), TrianglePolygonBuilder.ToP64(t.C, scale)];
             if (!Clipper.IsPositive(path))
             {
                 path.Reverse();
@@ -1685,21 +2339,23 @@ public static class ArenaAutoMapper
     }
 
     // union of the given triangles and floor boxes with seal boxes and obstacle footprints cut out, keeping the polygon containing the anchor when configured
-    public static List<CollisionOutlinesExtractor.PolygonWithHoles> BuildPolygons(ZoneCollisionScene scene, ReadOnlySpan<int> triangles, ReadOnlySpan<int> floorBoxes, List<SealCandidate> seals, IReadOnlySet<int> activeSeals,
-        List<Path64> extraUnion, List<Path64> extraCut, List<Vector3> extraYSource, Vector2? keepAnchor, AutoMapSettings s, out string keepStatus, out long unionMs, out int obstacleTriangles, out int obstacleBoxes, out int wallSnapEdges, HashSet<int> rim, IReadOnlySet<int>? excludedMeshes = null, IReadOnlySet<int>? floorMeshes = null, IReadOnlySet<int>? ignoredBoxes = null)
+    public static List<PolygonWithHoles> BuildPolygons(ZoneCollisionScene scene, ReadOnlySpan<int> triangles, ReadOnlySpan<int> floorBoxes, List<SealCandidate> seals, IReadOnlySet<int> activeSeals,
+        List<Path64> extraUnion, List<Path64> extraCut, List<Vector3> extraYSource, Vector2? keepAnchor, AutoMapSettings s, out string keepStatus, out long unionMs, out int obstacleTriangles, out int obstacleBoxes, out int wallSnapEdges, HashSet<int> rim, IReadOnlySet<int>? excludedMeshes = null, IReadOnlySet<int>? floorMeshes = null, IReadOnlySet<int>? ignoredBoxes = null, List<Vector2>? keepAny = null, CancellationToken ct = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var builder = new TrianglePolygonBuilder(s.SnapEpsXZ, BoxFootprintOps.DefaultScale);
         builder.AddTriangles(scene.Triangles.Span, triangles);
         var polys = builder.Build(s.MinArea);
+        ct.ThrowIfCancellationRequested();
+        var floor = new FloorSelection(scene.Triangles, triangles, s.WeldEps);
         if (s.SeamClose > 0f)
         {
             polys = BoxFootprintOps.Close(polys, s.SeamClose, s.MinArea);
         }
         List<Path64> cut = [.. extraCut];
-        List<Path64> union = [.. extraUnion];
+        Paths64 union = [.. extraUnion];
         List<Vector3> ySource = [.. extraYSource];
-        var rimPaths = RimExtensionPaths(scene, triangles, s, excludedMeshes, rim, out var rimBand);
+        var rimPaths = RimExtensionPaths(scene, floor, s, excludedMeshes, rim, out var rimBand, ct);
         if (rimPaths.Count > 0)
         {
             union.AddRange(rimPaths);
@@ -1713,7 +2369,7 @@ public static class ArenaAutoMapper
             }
         }
         List<(Vector3 a, Vector3 b)> snapSegments = [];
-        var snapFill = WallSnapPaths(scene, triangles, s, excludedMeshes, snapSegments, out wallSnapEdges);
+        var snapFill = WallSnapPaths(scene, floor, s, excludedMeshes, snapSegments, out wallSnapEdges, ct);
         if (snapFill.Count > 0)
         {
             union.AddRange(snapFill);
@@ -1726,7 +2382,7 @@ public static class ArenaAutoMapper
         for (var i = 0; i < floorBoxes.Length; ++i)
         {
             var box = scene.Boxes[floorBoxes[i]];
-            var fp = BoxFootprintOps.BoxFootprint(box.Corners, 0f);
+            var fp = box.FootprintXZ;
             if (fp.Count >= 3)
             {
                 union.Add(fp);
@@ -1742,7 +2398,7 @@ public static class ArenaAutoMapper
         obstacleBoxes = 0;
         if (s.CutObstacles)
         {
-            var footprints = ObstacleFootprints(scene, triangles, s, out obstacleTriangles, excludedMeshes, floorMeshes, rim, rimBand);
+            var footprints = ObstacleFootprints(scene, floor, s, out obstacleTriangles, excludedMeshes, floorMeshes, rim, rimBand, ct);
             if (obstacleTriangles <= s.ObstacleMaxTriangles)
             {
                 cut.AddRange(footprints);
@@ -1750,7 +2406,7 @@ public static class ArenaAutoMapper
         }
         if (s.CutBoxes)
         {
-            cut.AddRange(ObstacleBoxFootprints(scene, triangles, floorBoxes, seals, s, out obstacleBoxes, ignoredBoxes));
+            cut.AddRange(ObstacleBoxFootprints(scene, floor, floorBoxes, seals, s, out obstacleBoxes, ignoredBoxes));
         }
         for (var i = 0; i < seals.Count; ++i)
         {
@@ -1760,16 +2416,16 @@ public static class ArenaAutoMapper
                 ySource.AddRange(scene.Boxes[seals[i].BoxIndex].Corners);
             }
         }
+        ct.ThrowIfCancellationRequested();
         keepStatus = "";
         if (union.Count > 0)
         {
             // the floor union snaps vertices to the SnapEpsXZ grid while the extension paths carry raw vertices: grow them by the grid step so
             // they overlap the floor edge instead of leaving a hairline gap that would drop them as disconnected slivers
-            var grown = new Paths64(union.Count);
-            grown.AddRange(union);
-            union = [.. Clipper.InflatePaths(grown, MathF.Max(s.SnapEpsXZ, 0.01f) * BoxFootprintOps.DefaultScale, JoinType.Miter, EndType.Polygon)];
+            union = Clipper.InflatePaths(union, MathF.Max(s.SnapEpsXZ, 0.01f) * BoxFootprintOps.DefaultScale, JoinType.Miter, EndType.Polygon);
         }
-        if (cut.Count > 0 || union.Count > 0)
+        // the keep-containing-centre step applies whenever an anchor is known, cuts or not (the raw union can already be several pieces)
+        if (cut.Count > 0 || union.Count > 0 || keepAnchor != null)
         {
             polys = BoxFootprintOps.Apply(polys, cut, union, ySource, keepAnchor, s.MinArea, out keepStatus);
         }
@@ -1781,16 +2437,142 @@ public static class ArenaAutoMapper
         {
             keepStatus = $"obstacle cut skipped: {obstacleTriangles} obstacle triangles exceed the limit of {s.ObstacleMaxTriangles} (the fill leaked far - shrink the radius or block the leak). {keepStatus}";
         }
+        if (keepAny != null && keepAny.Count > 0 && polys.Count > 0)
+        {
+            // path mode: every piece the player stood in stays (a bridge severed from the ground by a cut is still walked), the rest goes
+            var scale = BoxFootprintOps.DefaultScale;
+            var pts = new Point64[keepAny.Count];
+            for (var i = 0; i < pts.Length; ++i)
+            {
+                pts[i] = TrianglePolygonBuilder.ToP64(keepAny[i], scale);
+            }
+            var before = polys.Count;
+            List<PolygonWithHoles> kept = [];
+            foreach (var poly in polys)
+            {
+                var outer = BoxFootprintOps.ToPath64(poly.Outer, false);
+                var holes = new Paths64(poly.Holes.Count);
+                foreach (var h in poly.Holes)
+                {
+                    holes.Add(BoxFootprintOps.ToPath64(h, false));
+                }
+                foreach (var pt in pts)
+                {
+                    if (BoxFootprintOps.Contains(outer, pt) && !holes.Exists(h => Clipper.PointInPolygon(pt, h) == PointInPolygonResult.IsInside))
+                    {
+                        kept.Add(poly);
+                        break;
+                    }
+                }
+            }
+            polys = kept;
+            keepStatus = $"kept {polys.Count} polygon(s) the path runs through, dropped {before - polys.Count}";
+        }
         unionMs = sw.ElapsedMilliseconds;
         return polys;
     }
 }
 
-// the mutable editing session: settings, centre, seals/pairs, adjacency cache, selected triangles/boxes and the resulting polygons
-public sealed class ArenaMapSession(ZoneCollisionScene scene)
+// everything the adjacency cache depends on
+public readonly record struct AdjacencyKey(Vector3 Centre, string Floors, int Mode, float Slope, float Radius, float Weld, float Step, int Adjacency, float Touch, long Activity,
+    float EdgeSnap, bool Blacklist, bool Relief, float ReliefStep, float Gap = 0f, float GapRise = 0f, long Path = 0, float TouchHeight = 0f);
+
+// one auto-map run: a snapshot of the session inputs taken on the UI thread, computed on a worker, published back with ApplyAutoMap
+public sealed class AutoMapJob
 {
-    public readonly ZoneCollisionScene Scene = scene;
+    public required AutoMapSettings Settings;
+    public required Vector3 Centre;
+    public required List<SealCandidate> Seals;
+    public required HashSet<int> ActiveSeals;
+    public required HashSet<int> FloorMeshes;
+    public required AdjacencyKey Key;
+    public TriangleAdjacency? Adjacency; // reused from the session when its key still matches, else built by Run
+    public AutoMapResult Result = new();
+    public PathRegion? Region;           // path mode: the corridor around the walked samples replaces the ring around the centre
+    public List<int>? ForcedTriangles;
+    public List<(int a, int b)>? ForcedLinks;
+}
+
+// a walked path as a candidate region: any point within the corridor of some sample
+public sealed class PathRegion
+{
+    public readonly List<Vector3> Samples;
+    public readonly float Corridor;
+    public readonly Vector2 Min, Max;
+    private readonly XZHashGrid _cells;
+
+    public PathRegion(List<Vector3> samples, float corridor)
+    {
+        Samples = samples;
+        Corridor = MathF.Max(corridor, 1f);
+        _cells = new(Corridor);
+        var bounds = samples.Count > 0 ? Bounds3.FromPoints(CollectionsMarshal.AsSpan(samples)) : new(new(float.MaxValue), new(float.MinValue));
+        Min = new(bounds.Min.X, bounds.Min.Z);
+        Max = new(bounds.Max.X, bounds.Max.Z);
+        for (var i = 0; i < samples.Count; ++i)
+        {
+            _cells.AddPoint(i, samples[i].X, samples[i].Z);
+        }
+    }
+
+    public bool IntersectsBounds(in Bounds3 b) => Samples.Count > 0 && b.Max.X >= Min.X - Corridor && b.Min.X <= Max.X + Corridor && b.Max.Z >= Min.Y - Corridor && b.Min.Z <= Max.Y + Corridor;
+
+    // within the corridor of a sample in XZ and within 6 y of it in height (the level the player was on)
+    public bool Contains(in Vector3 p)
+    {
+        var cx = _cells.CellOf(p.X);
+        var cz = _cells.CellOf(p.Z);
+        var r2 = Corridor * Corridor;
+        for (var dz = -1; dz <= 1; ++dz)
+        {
+            for (var dx = -1; dx <= 1; ++dx)
+            {
+                if (_cells.Cell(cx + dx, cz + dz) is not { } list)
+                {
+                    continue;
+                }
+                foreach (var i in list)
+                {
+                    var s = Samples[i];
+                    var ddx = s.X - p.X;
+                    var ddz = s.Z - p.Z;
+                    if (ddx * ddx + ddz * ddz <= r2 && MathF.Abs(s.Y - p.Y) <= 6f)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // the samples thinned to a spacing, as XZ points (keep-any anchors)
+    public List<Vector2> Thinned(float spacing)
+    {
+        List<Vector2> r = [];
+        foreach (var s in Samples)
+        {
+            var p = new Vector2(s.X, s.Z);
+            if (r.Count == 0 || (r[^1] - p).Length() >= spacing)
+            {
+                r.Add(p);
+            }
+        }
+        return r;
+    }
+}
+
+// the mutable editing session: settings, centre, seals/pairs, adjacency cache, selected triangles/boxes and the resulting polygons,
+// plus the scene state (layers / nodes / event object states) the scene is resolved under
+public sealed class ArenaMapSession
+{
+    public readonly ZoneCollisionScene Scene;
+    public readonly ZoneSceneModel Model;
     public readonly AutoMapSettings Settings = new();
+    public readonly ZoneSceneState State = new();
+    public readonly List<ZoneEObjRule> EObjRules = [];
+    public readonly List<ZoneScene> Scenes = [];
+    public int ActiveSceneIndex = -1;
     public Vector3 Centre;
     public bool CentreValid;
     public CentreEstimate LastEstimate;
@@ -1803,27 +2585,237 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
     public readonly HashSet<int> SelectedFloorBoxes = [];
     public readonly HashSet<int> FloorMeshes = []; // meshes forced to count as floor regardless of material
     public readonly HashSet<int> IgnoredBoxes = []; // obstacle boxes the author switched off (not cut)
+    public readonly List<PairOverride> PairOverrides = []; // the author's pairing decisions, by node path id (survive reloads and scene changes)
+    // path mode: the floor is what the party walked over (a dungeon segment), not a ring around the centre; seals do not block the fill, the corridor bounds it
+    public PathRegion? Path;
+    public List<int> ForcedTriangles = [];
+    public List<(int a, int b)> ForcedLinks = [];
     public AutoMapResult Last = new();
     public readonly HashSet<int> LastAutoResult = [];
-    public List<CollisionOutlinesExtractor.PolygonWithHoles> Polygons = [];
+    public List<PolygonWithHoles> Polygons = [];
     public string KeepStatus = "";
-    public long UnionMs;
     public int ObstacleTriangles;
     public int ObstacleBoxes;
     public int WallSnapEdges;
     public readonly HashSet<int> RimTriangles = []; // triangles the rim extension used in the last recompute
-    private (Vector3 centre, string floors, int mode, float slope, float radius, float weld, float step, int adjacency, float touch, int layerFingerprint) _adjacencyKey;
+    private AdjacencyKey _adjacencyKey;
 
+    public ArenaMapSession(ZoneCollisionScene scene, IZoneSheetSource? sheets = null)
+    {
+        Scene = scene;
+        Model = ZoneSceneModel.Build(scene, sheets ?? NullZoneSheetSource.Instance, Settings);
+        Resolve();
+    }
+
+    public ZoneScene? ActiveScene => ActiveSceneIndex >= 0 && ActiveSceneIndex < Scenes.Count ? Scenes[ActiveSceneIndex] : null;
+
+    public void SetPath(List<Vector3> samples, float corridor, List<int> forcedTriangles, List<(int a, int b)> forcedLinks)
+    {
+        Path = new(samples, corridor);
+        ForcedTriangles = forcedTriangles;
+        ForcedLinks = forcedLinks;
+        if (samples.Count > 0)
+        {
+            SetCentre(samples[0]);
+        }
+    }
+
+    public void ClearPath()
+    {
+        Path = null;
+        ForcedTriangles = [];
+        ForcedLinks = [];
+    }
+
+    // the triangles under the path samples: the nearest candidate in height (within 2 y) at each sample's XZ
+    private static List<int> PathSeeds(ZoneCollisionScene scene, TriangleAdjacency adj, PathRegion region, CancellationToken ct)
+    {
+        List<int> seeds = [];
+        var grid = adj.CandidateGrid;
+        if (grid == null)
+        {
+            return seeds;
+        }
+        HashSet<int> seen = [];
+        Vector3? last = null;
+        var n = 0;
+        foreach (var s in region.Samples)
+        {
+            if ((++n & 4095) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            if (last is { } l && (l - s).Length() < 1f)
+            {
+                continue;
+            }
+            last = s;
+            var best = ArenaAutoMapper.TriangleUnder(scene, grid, s, 2f);
+            if (best >= 0 && seen.Add(best))
+            {
+                seeds.Add(best);
+            }
+        }
+        return seeds;
+    }
+
+    // re-resolve the scene under the current state; every consumer of IsMeshEnabled/IsBoxEnabled sees the new arrays at once
+    public void Resolve()
+    {
+        ZoneSceneResolver.Resolve(Scene, State, Model, EObjRules);
+        Adjacency = null;
+    }
+
+    public void EnsureResolved()
+    {
+        if (Scene.Activity.Dirty)
+        {
+            Resolve();
+        }
+    }
+
+    public void SetLayerEnabled(int layerIndex, bool enabled)
+    {
+        var id = Scene.Layers[layerIndex].PathId;
+        if (enabled)
+        {
+            State.DisabledLayers.Remove(id);
+        }
+        else
+        {
+            State.DisabledLayers.Add(id);
+        }
+        ActiveScene?.State.CopyFrom(State);
+        Resolve();
+    }
+
+    public void SetNodeOverride(int nodeIndex, bool? active)
+    {
+        var id = Scene.Nodes[nodeIndex].PathId;
+        if (active is { } a)
+        {
+            State.NodeOverrides[id] = a;
+        }
+        else
+        {
+            State.NodeOverrides.Remove(id);
+        }
+        ActiveScene?.State.CopyFrom(State);
+        Resolve();
+    }
+
+    // null clears the state (back to the layout default 0)
+    public void SetEObjState(int eobjIndex, ushort? state, bool objectChannel = false)
+    {
+        var id = Model.EventObjects[eobjIndex].PathId;
+        var dict = objectChannel ? State.EObjObjectStates : State.EObjStates;
+        if (state is { } s)
+        {
+            dict[id] = s;
+        }
+        else
+        {
+            dict.Remove(id);
+        }
+        ActiveScene?.State.CopyFrom(State);
+        Resolve();
+    }
+
+    public ushort? EObjState(int eobjIndex, bool objectChannel = false)
+    {
+        var dict = objectChannel ? State.EObjObjectStates : State.EObjStates;
+        return dict.TryGetValue(Model.EventObjects[eobjIndex].PathId, out var s) ? s : null;
+    }
+
+    public void ActivateScene(int index, bool redetectSeals = true)
+    {
+        if (index < 0 || index >= Scenes.Count)
+        {
+            return;
+        }
+        ActiveSceneIndex = index;
+        State.CopyFrom(Scenes[index].State);
+        Resolve();
+        if (redetectSeals)
+        {
+            DetectSeals();
+        }
+    }
+
+    // the current state with one event object forced to a state: 0 = collision on (sealed / closed), 7 = removed (open)
+    public ZoneScene DeriveScene(int eobjIndex, ushort state, string name)
+    {
+        var scene = new ZoneScene { Name = name, State = State.Clone(), Source = ZoneSceneSource.Derived };
+        scene.State.EObjStates[Model.EventObjects[eobjIndex].PathId] = state;
+        return scene;
+    }
+
+    private readonly SealClassCache _sealClasses = new();
+
+    // seals are geometry markers: every placed seal is listed, but only the ones with collision under the current state are cut by default
     public void DetectSeals()
     {
-        Seals = ArenaAutoMapper.FindSeals(Scene, Settings);
+        EnsureResolved();
+        Seals = ArenaAutoMapper.FindSeals(Scene, Settings, _sealClasses);
         ActiveSeals.Clear();
         for (var i = 0; i < Seals.Count; ++i)
         {
-            ActiveSeals.Add(Seals[i].BoxIndex);
+            if (Scene.IsBoxEnabled(Seals[i].BoxIndex))
+            {
+                ActiveSeals.Add(Seals[i].BoxIndex);
+            }
         }
-        Pairs = ArenaAutoMapper.ComputePairs(Seals, Scene.Markers, Settings);
+        Pairs = ArenaAutoMapper.AutoPairRooms(Seals, Scene, Model, Settings, PairOverrides);
         PairIndex = -1;
+    }
+
+    public ulong SealPathId(int seal) => ArenaAutoMapper.SealPathId(Scene, Seals[seal]);
+
+    // the pair a seal sits in, -1 when it is single
+    public int PairOf(int seal) => Pairs.FindIndex(p => (p.SealA == seal || p.SealB == seal) && !p.IsSingle);
+
+    public void SetPairOverride(int seal, ulong partnerPathId, bool partnerIsNode)
+    {
+        var id = SealPathId(seal);
+        PairOverrides.RemoveAll(o => o.SealPathId == id);
+        PairOverrides.Add(new(id, partnerPathId, partnerIsNode));
+    }
+
+    public void ClearPairOverride(int seal)
+    {
+        var id = SealPathId(seal);
+        PairOverrides.RemoveAll(o => o.SealPathId == id);
+    }
+
+    // what a seal could pair with: other seals within twice the pair distance, nodes within it
+    public List<(string label, ulong pathId, bool isNode, float distance)> PartnerCandidates(int seal)
+    {
+        List<(string, ulong, bool, float)> r = [];
+        var c = Seals[seal].Center;
+        for (var j = 0; j < Seals.Count; ++j)
+        {
+            if (j == seal)
+            {
+                continue;
+            }
+            var d = (Seals[j].Center - c).Length();
+            if (d <= Settings.SealPairMaxDistance * 2f)
+            {
+                r.Add(($"seal {j}", SealPathId(j), false, d));
+            }
+        }
+        foreach (var (m, pos, kind) in ArenaAutoMapper.PairNodes(Scene, Model))
+        {
+            var d = (pos - c).Length();
+            if (d <= Settings.SealPairMaxDistance * 1.5f)
+            {
+                var marker = Scene.Markers[m];
+                var eo = marker.Type == (int)LgbInstanceType.EventObject ? Model.EventObjectByKey.GetValueOrDefault(marker.InstanceKey, -1) : -1;
+                r.Add(($"{kind} {(eo >= 0 ? Model.EventObjects[eo].Label : $"key 0x{marker.InstanceKey:X}")}", ArenaAutoMapper.MarkerPathId(Scene, m), true, d));
+            }
+        }
+        r.Sort((a, b) => a.Item4.CompareTo(b.Item4));
+        return r;
     }
 
     // default pair: nearest to the preferred point when given, otherwise the seal pair with the lowest indices (first boss room in layout order)
@@ -1853,7 +2845,8 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
                 {
                     continue;
                 }
-                score = p.SealA * 1000f + (p.SealB >= 0 ? p.SealB : 500 + p.MarkerIndex) + (p.SealB >= 0 ? 0f : 1e5f);
+                // rooms first (both seals of a boss arena), then seal + node, then loose seal pairs; lowest indices = first room in layout order
+                score = p.SealA * 1000f + (p.SealB >= 0 ? p.SealB : 500 + p.MarkerIndex) + (p.IsRoom ? 0f : p.SealB >= 0 ? 2e5f : 1e5f);
             }
             if (score < best)
             {
@@ -1875,31 +2868,20 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
         }
         if (PairIndex < 0)
         {
-            LastEstimate = new(preferNear ?? Vector3.Zero, -1, -1, -1, 0f, true, "no seals");
+            LastEstimate = new(preferNear ?? Vector3.Zero, -1, -1, -1, 0f, true, "no seals", true);
             Centre = LastEstimate.Centre;
             CentreValid = false;
             return;
         }
         LastEstimate = ArenaAutoMapper.EstimateCentre(Pairs[PairIndex], Seals, Scene.Markers, Settings, preferNear);
         Centre = LastEstimate.Centre;
-        CentreValid = LastEstimate.Reason != "no seals";
+        CentreValid = !LastEstimate.NoSeals;
     }
 
     public void SetCentre(Vector3 c)
     {
         Centre = c;
         CentreValid = true;
-    }
-
-    private int LayerFingerprint()
-    {
-        var h = 17;
-        var layers = Scene.Layers;
-        for (var i = 0; i < layers.Count; ++i)
-        {
-            h = h * 31 + (layers[i].Enabled ? 1 : 0);
-        }
-        return h * 31 + Scene.Meshes.Count;
     }
 
     private string FloorKey()
@@ -1912,27 +2894,99 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
         return sb.ToString();
     }
 
-    public TriangleAdjacency EnsureAdjacency()
+    private AdjacencyKey CurrentAdjacencyKey()
     {
+        EnsureResolved();
         var floorKey = FloorKey();
         foreach (var m in FloorMeshes)
         {
             floorKey += $"m{m};";
         }
-        var key = (Centre, floorKey, (int)Settings.FloorMatchMode, Settings.MaxSlopeDeg, Settings.MaxRadius, Settings.WeldEps, Settings.StepHeight, (int)Settings.Adjacency, Settings.BoxFloorTouchEps, LayerFingerprint());
+        return new(Centre, floorKey, (int)Settings.FloorMatchMode, Settings.MaxSlopeDeg, Settings.MaxRadius, Settings.WeldEps, Settings.StepHeight, (int)Settings.Adjacency, Settings.BoxFloorTouchEps, Scene.Activity.Fingerprint ^ ((long)Scene.Meshes.Count << 48),
+            Settings.EdgeSnap, Settings.ExcludeUnwalkableMaterials, Settings.ReliefPromotion, Settings.ReliefStep, Settings.GapBridge, Settings.GapBridgeRise, PathKey(), Settings.BoxFloorTouchHeight);
+    }
+
+    private long PathKey()
+    {
+        if (Path == null)
+        {
+            return 0;
+        }
+        var h = ZoneBinary.Fnv1aOffset;
+        h = ZoneBinary.Fnv1a64(h, (ulong)Path.Samples.Count);
+        h = ZoneBinary.Fnv1a64(h, (ulong)BitConverter.SingleToInt32Bits(Path.Corridor));
+        h = ZoneBinary.Fnv1a64(h, (ulong)ForcedTriangles.Count);
+        h = ZoneBinary.Fnv1a64(h, (ulong)ForcedLinks.Count);
+        foreach (var s in Path.Samples)
+        {
+            h = ZoneBinary.Fnv1a64(h, (ulong)(uint)BitConverter.SingleToInt32Bits(s.X) << 32 | (uint)BitConverter.SingleToInt32Bits(s.Z));
+        }
+        return (long)h;
+    }
+
+    // the adjacency for the current inputs (the same ones the key describes: path corridor and walked links included)
+    public TriangleAdjacency EnsureAdjacency()
+    {
+        var key = CurrentAdjacencyKey();
         if (Adjacency == null || key != _adjacencyKey)
         {
-            Adjacency = TriangleAdjacency.Build(Scene, Centre, Settings, FloorMeshes);
+            Adjacency = TriangleAdjacency.Build(Scene, Centre, Settings, FloorMeshes, Path, Path != null ? ForcedTriangles : null, Path != null ? ForcedLinks : null);
             _adjacencyKey = key;
         }
         return Adjacency;
     }
 
+    // synchronous auto-map (project load); the editor button runs the same three steps with Run on a worker
     public void AutoMap()
     {
-        var adj = EnsureAdjacency();
-        var seed = ArenaAutoMapper.FindSeed(Scene, adj, Centre, Settings);
-        Last = ArenaAutoMapper.FloodFill(Scene, adj, seed, Seals, ActiveSeals, Centre, Settings);
+        var job = PrepareAutoMap();
+        RunAutoMap(job);
+        ApplyAutoMap(job);
+    }
+
+    // UI thread: snapshot the inputs
+    public AutoMapJob PrepareAutoMap()
+    {
+        var key = CurrentAdjacencyKey();
+        return new()
+        {
+            Settings = Settings.Clone(),
+            Centre = Centre,
+            Seals = Seals,
+            ActiveSeals = Path != null ? [] : [.. ActiveSeals],
+            FloorMeshes = [.. FloorMeshes],
+            Key = key,
+            Adjacency = Adjacency != null && key == _adjacencyKey ? Adjacency : null,
+            Region = Path,
+            ForcedTriangles = Path != null ? [.. ForcedTriangles] : null,
+            ForcedLinks = Path != null ? [.. ForcedLinks] : null,
+        };
+    }
+
+    // any thread: the scene is read-only while a job runs (layer toggles and terrain loads change the key, so the result is then discarded)
+    public void RunAutoMap(AutoMapJob job, CancellationToken ct = default)
+    {
+        job.Adjacency ??= TriangleAdjacency.Build(Scene, job.Centre, job.Settings, job.FloorMeshes, job.Region, job.ForcedTriangles, job.ForcedLinks, ct);
+        if (job.Region != null)
+        {
+            var seeds = PathSeeds(Scene, job.Adjacency, job.Region, ct);
+            job.Result = ArenaAutoMapper.FloodFill(Scene, job.Adjacency, CollectionsMarshal.AsSpan(seeds), job.Seals, job.ActiveSeals, job.Centre, job.Settings, ct);
+            return;
+        }
+        var seed = ArenaAutoMapper.FindSeed(Scene, job.Adjacency, job.Centre, job.Settings);
+        job.Result = ArenaAutoMapper.FloodFill(Scene, job.Adjacency, seed, job.Seals, job.ActiveSeals, job.Centre, job.Settings, ct);
+    }
+
+    // UI thread: publish; false when the inputs changed since Prepare (the caller runs again)
+    public bool ApplyAutoMap(AutoMapJob job)
+    {
+        if (job.Key != CurrentAdjacencyKey() || !ReferenceEquals(job.Seals, Seals) || job.Region == null && !job.ActiveSeals.SetEquals(ActiveSeals))
+        {
+            return false;
+        }
+        Adjacency = job.Adjacency;
+        _adjacencyKey = job.Key;
+        Last = job.Result;
         Selected.Clear();
         LastAutoResult.Clear();
         SelectedFloorBoxes.Clear();
@@ -1945,46 +2999,37 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
         {
             SelectedFloorBoxes.Add(b);
         }
+        return true;
+    }
+
+    // takes every node reached: triangles into dst, floor boxes into the session's selection
+    private struct GrowVisitor(TriangleAdjacency adj, HashSet<int> dst, HashSet<int> boxes) : IWalkVisitor
+    {
+        public bool Enter(int node, int depth)
+        {
+            if (adj.IsBoxNode(node))
+            {
+                boxes.Add(adj.FloorBoxes[node - adj.Candidates.Length]);
+            }
+            else
+            {
+                dst.Add(adj.Candidates[node]);
+            }
+            return true;
+        }
     }
 
     public void GrowFrom(int tri, int depth, HashSet<int> dst)
     {
         var adj = EnsureAdjacency();
-        if (!adj.GlobalToLocal.TryGetValue(tri, out var start))
+        var start = adj.LocalOf(tri);
+        dst.Add(tri);
+        if (start < 0)
         {
-            dst.Add(tri);
             return;
         }
-        Dictionary<int, int> dist = new() { [start] = 0 };
-        Queue<int> queue = new();
-        queue.Enqueue(start);
-        dst.Add(tri);
-        while (queue.Count > 0)
-        {
-            var cur = queue.Dequeue();
-            var d = dist[cur];
-            if (d >= depth)
-            {
-                continue;
-            }
-            foreach (var nb in adj.NeighboursOf(cur))
-            {
-                if (dist.ContainsKey(nb))
-                {
-                    continue;
-                }
-                dist[nb] = d + 1;
-                if (adj.IsBoxNode(nb))
-                {
-                    SelectedFloorBoxes.Add(adj.FloorBoxes[nb - adj.Candidates.Length]);
-                }
-                else
-                {
-                    dst.Add(adj.Candidates[nb]);
-                }
-                queue.Enqueue(nb);
-            }
-        }
+        var visitor = new GrowVisitor(adj, dst, SelectedFloorBoxes);
+        adj.Walk([start], depth, ref visitor);
     }
 
     // add = select the mesh's walkable-slope triangles (all of them when floorOnly is false or the mesh is a forced floor mesh); !add = deselect all
@@ -1999,7 +3044,7 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
         {
             if (add)
             {
-                if (tris[i].NormalY >= minNormalY && (!floorOnly || forced || Settings.FloorMatches(tris[i])))
+                if (tris[i].NormalY >= minNormalY && !Settings.IsBlocked(tris[i]) && (!floorOnly || forced || Settings.FloorMatches(tris[i])))
                 {
                     Selected.Add(i);
                 }
@@ -2011,46 +3056,14 @@ public sealed class ArenaMapSession(ZoneCollisionScene scene)
         }
     }
 
-    public int PickTriangle(Vector2 xz, float? preferY)
-    {
-        var tris = Scene.Triangles.Span;
-        var best = -1;
-        var bestScore = float.MaxValue;
-        var meshes = Scene.Meshes;
-        for (var m = 0; m < meshes.Count; ++m)
-        {
-            var mesh = meshes[m];
-            if (mesh.TriCount == 0 || !Scene.IsMeshEnabled(m) || !mesh.WorldBounds.ContainsXZ(xz.X, xz.Y))
-            {
-                continue;
-            }
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
-            {
-                ref readonly var t = ref tris[i];
-                if (!t.ContainsXZ(xz.X, xz.Y))
-                {
-                    continue;
-                }
-                var y = t.YAt(xz.X, xz.Y);
-                var score = preferY is { } py ? MathF.Abs(y - py) : -y;
-                if (score < bestScore)
-                {
-                    bestScore = score;
-                    best = i;
-                }
-            }
-        }
-        return best;
-    }
-
-    public List<CollisionOutlinesExtractor.PolygonWithHoles> Recompute(List<Path64> extraUnion, List<Path64> extraCut, List<Vector3> extraYSource)
+    public List<PolygonWithHoles> Recompute(List<Path64> extraUnion, List<Path64> extraCut, List<Vector3> extraYSource)
     {
         var snapshot = new int[Selected.Count];
         Selected.CopyTo(snapshot);
         var boxes = new int[SelectedFloorBoxes.Count];
         SelectedFloorBoxes.CopyTo(boxes);
-        Polygons = ArenaAutoMapper.BuildPolygons(Scene, snapshot, boxes, Seals, ActiveSeals, extraUnion, extraCut, extraYSource, Settings.KeepPolygonContainingCentre ? new Vector2(Centre.X, Centre.Z) : null, Settings, out KeepStatus, out UnionMs, out ObstacleTriangles, out ObstacleBoxes, out WallSnapEdges, RimTriangles, null, FloorMeshes, IgnoredBoxes);
+        var keepAny = Path?.Thinned(2f);
+        Polygons = ArenaAutoMapper.BuildPolygons(Scene, snapshot, boxes, Seals, ActiveSeals, extraUnion, extraCut, extraYSource, Settings.KeepPolygonContainingCentre && Path == null ? new Vector2(Centre.X, Centre.Z) : null, Settings, out KeepStatus, out _, out ObstacleTriangles, out ObstacleBoxes, out WallSnapEdges, RimTriangles, null, FloorMeshes, IgnoredBoxes, keepAny);
         return Polygons;
     }
 }

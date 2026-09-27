@@ -11,64 +11,30 @@ namespace BossMod;
 
 public static unsafe class CollisionOutlinesExtractor
 {
-    public sealed class PolygonWithHoles
-    {
-        public List<Vector3> Outer = [];
-        public List<List<Vector3>> Holes = [];
-    }
-
     public enum ClipboardVectorFormat { Vector2XZ, Vector3XYZ }
-
-    public enum MaterialMatchMode
-    {
-        EffectiveMasked, // current behavior
-        EffectiveExact, // effective == wantedId
-        PrimMasked, // (raw prim) masked compare
-        PrimExact // (raw prim) exact id match
-    }
 
     public static List<PolygonWithHoles> ExtractPolygonsUnion(ColliderMesh* coll, ulong wantedMaterialId, ulong wantedMask,
       float snapEpsXZ = 1e-4f, Vector2 centerXZ = default, float radius = 0f, bool strictRadius = true,
       MaterialMatchMode matchMode = MaterialMatchMode.PrimExact, long scale = 1024 * 1024, float minAreaMeters2 = 1e-6f)
     {
-        var res = new List<PolygonWithHoles>();
         if (coll == null || coll->MeshIsSimple || coll->Mesh == null)
         {
-            return res;
+            return [];
         }
-
-        // precompute snapping parameters
-        var snapInt = ComputeSnapInt(snapEpsXZ, scale);
-        var subjects = new Paths64();
-        var yLUT = new Dictionary<Point64, float>(1 << 13);
-        var edges = new List<EdgeY>(1 << 15);
-
-        CollectSubjectTriangles(coll, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
-
-        if (subjects.Count == 0)
-        {
-            return res;
-        }
-
-        var union = Clipper.Union(subjects, FillRule.NonZero);
-        return Paths64ToPolys(union, yLUT, edges, scale, snapInt, minAreaMeters2);
+        var builder = new TrianglePolygonBuilder(snapEpsXZ, scale);
+        CollectSubjectTriangles(coll, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
+        return builder.Build(minAreaMeters2);
     }
 
     public static List<PolygonWithHoles> ExtractPolygonsUnionStreamed(ColliderStreamed* streamed, ulong wantedMaterialId,
         ulong wantedMask, float snapEpsXZ = 1e-4f, Vector2 centerXZ = default, float radius = 0f, bool strictRadius = true,
         MaterialMatchMode matchMode = MaterialMatchMode.PrimExact, long scale = 1024 * 1024, float minAreaMeters2 = 1e-6f)
     {
-        var res = new List<PolygonWithHoles>();
         if (streamed == null || streamed->Header == null || streamed->Elements == null)
         {
-            return res;
+            return [];
         }
-
-        var snapInt = ComputeSnapInt(snapEpsXZ, scale);
-        var subjects = new Paths64();
-        var yLUT = new Dictionary<Point64, float>(1 << 15);
-        var edges = new List<EdgeY>(1 << 17);
-
+        var builder = new TrianglePolygonBuilder(snapEpsXZ, scale);
         int n = streamed->Header->NumMeshes;
         for (var i = 0; i < n; ++i)
         {
@@ -78,17 +44,9 @@ public static unsafe class CollisionOutlinesExtractor
             {
                 continue;
             }
-
-            CollectSubjectTriangles(cm, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
+            CollectSubjectTriangles(cm, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
         }
-
-        if (subjects.Count == 0)
-        {
-            return res;
-        }
-
-        var union = Clipper.Union(subjects, FillRule.NonZero);
-        return Paths64ToPolys(union, yLUT, edges, scale, snapInt, minAreaMeters2);
+        return builder.Build(minAreaMeters2);
     }
 
     public static List<PolygonWithHoles> ExtractPolygonsUnionMany(
@@ -96,18 +54,12 @@ public static unsafe class CollisionOutlinesExtractor
         float snapEpsXZ = 1e-4f, Vector2 centerXZ = default, float radius = 0f, bool strictRadius = true,
         MaterialMatchMode matchMode = MaterialMatchMode.PrimExact, long scale = 1024 * 1024, float minAreaMeters2 = 1e-6f)
     {
-        var res = new List<PolygonWithHoles>();
-        var countM = meshPtrs.Count;
-        if (meshPtrs == null || countM == 0)
+        if (meshPtrs == null || meshPtrs.Count == 0)
         {
-            return res;
+            return [];
         }
-
-        var snapInt = ComputeSnapInt(snapEpsXZ, scale);
-        var subjects = new Paths64();
-        var yLUT = new Dictionary<Point64, float>(1 << 16);
-        var edges = new List<EdgeY>(1 << 18);
-
+        var builder = new TrianglePolygonBuilder(snapEpsXZ, scale);
+        var countM = meshPtrs.Count;
         for (var i = 0; i < countM; ++i)
         {
             var cm = (ColliderMesh*)meshPtrs[i];
@@ -115,32 +67,24 @@ public static unsafe class CollisionOutlinesExtractor
             {
                 continue;
             }
-
-            CollectSubjectTriangles(cm, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
+            CollectSubjectTriangles(cm, wantedMaterialId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
         }
-
-        if (subjects.Count == 0)
-        {
-            return res;
-        }
-
-        var union = Clipper.Union(subjects, FillRule.NonZero);
-        return Paths64ToPolys(union, yLUT, edges, scale, snapInt, minAreaMeters2);
+        return builder.Build(minAreaMeters2);
     }
 
-    private static void CollectSubjectTriangles(ColliderMesh* coll, ulong wantedId, ulong wantedMask, Vector2 centerXZ, float radius, bool strictRadius, MaterialMatchMode matchMode,
-       long scale, long snapInt, Paths64 subjects, Dictionary<Point64, float> yLUT, List<EdgeY> edges)
+    // walks the mesh's node tree and feeds the matching, in-radius triangles to the shared builder (snap, winding, union and Y recovery live there)
+    private static void CollectSubjectTriangles(ColliderMesh* coll, ulong wantedId, ulong wantedMask, Vector2 centerXZ, float radius, bool strictRadius, MaterialMatchMode matchMode, TrianglePolygonBuilder builder)
     {
         var mesh = (MeshPCB*)coll->Mesh;
         var world = coll->World;
         ulong objMask = coll->Collider.ObjectMaterialMask;
         ulong objId = coll->Collider.ObjectMaterialValue & objMask;
 
-        CollectNode(mesh->RootNode, ref world, objId, objMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
+        CollectNode(mesh->RootNode, ref world, objId, objMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
     }
 
     private static void CollectNode(MeshPCB.FileNode* node, ref Matrix4x3 world, ulong objMatId, ulong objMatMask, ulong wantedId, ulong wantedMask,
-        Vector2 centerXZ, float radius, bool strictRadius, MaterialMatchMode matchMode, long scale, long snapInt, Paths64 subjects, Dictionary<Point64, float> yLUT, List<EdgeY> edges)
+        Vector2 centerXZ, float radius, bool strictRadius, MaterialMatchMode matchMode, TrianglePolygonBuilder builder)
     {
         if (node == null)
         {
@@ -188,180 +132,18 @@ public static unsafe class CollisionOutlinesExtractor
                     }
                 }
 
-                // quantize & SNAP to grid to fuse seams
-                var pa = Snap(ToP64(a, scale), snapInt);
-                var pb = Snap(ToP64(b, scale), snapInt);
-                var pc = Snap(ToP64(c, scale), snapInt);
-
-                // drop degenerate after snapping (any duplicates)
-                if (pa == pb || pb == pc || pc == pa)
-                {
-                    continue;
-                }
-
-                // enforce CCW in XZ after snap (consistent winding -> no NonZero cancellations)
-                EnsureCCW(ref pa, ref pb, ref pc);
-
-                // add triangle
-                subjects.Add([pa, pb, pc]);
-
-                // Y lifting LUT + edges for interpolation
-                AccumY(yLUT, pa, a.Y);
-                AccumY(yLUT, pb, b.Y);
-                AccumY(yLUT, pc, c.Y);
-
-                edges.Add(new(pa, pb, a.Y, b.Y));
-                edges.Add(new(pb, pc, b.Y, c.Y));
-                edges.Add(new(pc, pa, c.Y, a.Y));
+                builder.AddTriangle(a, b, c);
             }
         }
 
-        CollectNode(node->Child1, ref world, objMatId, objMatMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
-        CollectNode(node->Child2, ref world, objMatId, objMatMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, scale, snapInt, subjects, yLUT, edges);
-    }
-
-    private static List<PolygonWithHoles> Paths64ToPolys(Paths64 paths, Dictionary<Point64, float> yLUT, List<EdgeY> edges, long scale, long snapInt, float minAreaMeters2)
-    {
-        // filter slivers (post-union) using area threshold
-        var minAreaInt = Math.Max(1.0, minAreaMeters2 * (double)scale * scale);
-
-        var outers = new List<(Path64 path, double area, AABB2 bb)>(paths.Count);
-        var holes = new List<(Path64 path, double area, AABB2 bb)>();
-
-        foreach (var p in paths)
-        {
-            if (p.Count < 3)
-            {
-                continue;
-            }
-
-            // small clean-up: remove consecutive duplicates after union
-            var cleaned = RemoveConsecutiveDuplicates(p);
-            if (cleaned.Count < 3)
-            {
-                continue;
-            }
-
-            var aSigned = AreaSigned(cleaned);
-            var aInt = Math.Abs(aSigned);
-            if (aInt < minAreaInt)
-            {
-                continue; // drop tiny fragments
-            }
-
-            var bb = BoundsXZ(cleaned);
-
-            if (aSigned > 0d)
-            {
-                outers.Add((cleaned, aSigned, bb));
-            }
-            else
-            {
-                holes.Add((cleaned, aSigned, bb));
-            }
-        }
-
-        outers.Sort(static (A, B) => B.area.CompareTo(A.area));
-        holes.Sort(static (A, B) => Math.Abs(B.area).CompareTo(Math.Abs(A.area)));
-
-        var countO = outers.Count;
-        var countH = holes.Count;
-        var res = new List<PolygonWithHoles>(countO + countH);
-
-        for (var i = 0; i < countO; ++i)
-        {
-            var poly = new PolygonWithHoles();
-            var outer = outers[i];
-            PolyToVectorsCCW(outer.path, yLUT, edges, scale, poly.Outer);
-
-            for (var h = 0; h < countH; ++h)
-            {
-                var hol = holes[h];
-                if (hol.path == null)
-                {
-                    continue;
-                }
-                if (!outer.bb.Contains(hol.bb))
-                {
-                    continue;
-                }
-
-                var centroid = Centroid(hol.path, scale);
-                if (PointInPolygonXZ(centroid, outer.path))
-                {
-                    var hole = new List<Vector3>();
-                    PolyToVectorsCCW(hol.path, yLUT, edges, scale, hole);
-                    poly.Holes.Add(hole);
-                    holes[h] = (null!, 0, default);
-                }
-            }
-            res.Add(poly);
-        }
-
-        for (var i = 0; i < countH; ++i)
-        {
-            var h = holes[i];
-            if (h.path == null)
-            {
-                continue;
-            }
-            var poly = new PolygonWithHoles();
-            PolyToVectorsCCW(h.path, yLUT, edges, scale, poly.Outer);
-            res.Add(poly);
-        }
-        return res;
-    }
-
-    private static Path64 RemoveConsecutiveDuplicates(Path64 p)
-    {
-        if (p.Count <= 2)
-        {
-            return p;
-        }
-        var count = p.Count;
-        var outp = new Path64(count);
-        Point64 prev = new(long.MinValue, long.MinValue);
-        for (var i = 0; i < count; ++i)
-        {
-            var pi = p[i];
-            if (i == 0 || pi.X != prev.X || pi.Y != prev.Y)
-            {
-                outp.Add(pi);
-            }
-            prev = pi;
-        }
-        // also check last==first
-        var countO = outp.Count;
-        if (countO >= 2 && outp[0] == outp[^1])
-        {
-            outp.RemoveAt(countO - 1);
-        }
-        return outp;
-    }
-
-    private static void PolyToVectorsCCW(Path64 path, Dictionary<Point64, float> yLUT, List<EdgeY> edges, long scale, List<Vector3> dst)
-    {
-        if (AreaSigned(path) < 0d)
-        {
-            path.Reverse();
-        }
-        var count = path.Count;
-        dst.Capacity = Math.Max(dst.Capacity, count);
-        for (var i = 0; i < count; ++i)
-        {
-            var p = path[i];
-            var y = SampleY(p, yLUT, edges);
-            dst.Add(new Vector3(p.X / (float)scale, y, p.Y / (float)scale));
-        }
+        CollectNode(node->Child1, ref world, objMatId, objMatMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
+        CollectNode(node->Child2, ref world, objMatId, objMatMask, wantedId, wantedMask, centerXZ, radius, strictRadius, matchMode, builder);
     }
 
     public static string FormatForClipboard(List<PolygonWithHoles> polys, ClipboardVectorFormat fmt, int decimals = 5)
     {
-        var ci = System.Globalization.CultureInfo.InvariantCulture;
-        var f = "F" + decimals;
-
-        string Vec2(Vector3 v) => $"new({v.X.ToString(f, ci)}f, {v.Z.ToString(f, ci)}f)";
-        string Vec3(Vector3 v) => $"new({v.X.ToString(f, ci)}f, {v.Y.ToString(f, ci)}f, {v.Z.ToString(f, ci)}f)";
+        string Vec2(Vector3 v) => $"new({CollisionArenaCodeGen.F(v.X, decimals)}, {CollisionArenaCodeGen.F(v.Z, decimals)})";
+        string Vec3(Vector3 v) => $"new({CollisionArenaCodeGen.F(v.X, decimals)}, {CollisionArenaCodeGen.F(v.Y, decimals)}, {CollisionArenaCodeGen.F(v.Z, decimals)})";
 
         string V(Vector3 v) => fmt == ClipboardVectorFormat.Vector2XZ ? Vec2(v) : Vec3(v);
 
@@ -434,195 +216,6 @@ public static unsafe class CollisionOutlinesExtractor
     {
         float dx = v.X - c.X, dz = v.Z - c.Y;
         return dx * dx + dz * dz <= r2;
-    }
-
-    private static Point64 ToP64(in Vector3 v, long s) => new((long)Math.Round(v.X * s), (long)Math.Round(v.Z * s));
-
-    private static void AccumY(Dictionary<Point64, float> lut, Point64 p, float y)
-    {
-        lut[p] = lut.TryGetValue(p, out var cur) ? (cur + y) * 0.5f : y;
-    }
-
-    private readonly struct EdgeY
-    {
-        public readonly Point64 A, B; public readonly float YA, YB;
-        public EdgeY(Point64 a, Point64 b, float ya, float yb)
-        {
-            // normalize key order to make on-seg checks stable
-            if (a.X > b.X || a.X == b.X && a.Y > b.Y)
-            {
-                (a, b) = (b, a);
-                (ya, yb) = (yb, ya);
-            }
-            A = a;
-            B = b;
-            YA = ya;
-            YB = yb;
-        }
-    }
-
-    private static float SampleY(Point64 p, Dictionary<Point64, float> lut, List<EdgeY> edges)
-    {
-        if (lut.TryGetValue(p, out var y))
-        {
-            return y;
-        }
-
-        // check if lies on any recorded edge (exact integer colinearity)
-        var count = edges.Count;
-        for (int i = 0, n = count; i < n; ++i)
-        {
-            var e = edges[i];
-            if (!OnSegment(p, e.A, e.B))
-            {
-                continue;
-            }
-
-            // param t along the dominant axis
-            long dx = e.B.X - e.A.X, dz = e.B.Y - e.A.Y;
-            var t = Math.Abs(dx) >= Math.Abs(dz) ? dx == 0L ? 0d : (p.X - e.A.X) / (double)dx : dz == 0L ? 0d : (p.Y - e.A.Y) / (double)dz;
-            return (float)(e.YA + t * (e.YB - e.YA));
-        }
-
-        // fallback: nearest known vertex
-        var bestY = 0f;
-        var bestD2 = double.MaxValue;
-        foreach (var kv in lut)
-        {
-            double ddx = kv.Key.X - p.X, ddz = kv.Key.Y - p.Y;
-            var d2 = ddx * ddx + ddz * ddz;
-            if (d2 < bestD2)
-            {
-                bestD2 = d2;
-                bestY = kv.Value;
-            }
-        }
-        return bestY;
-    }
-
-    private static long ComputeSnapInt(float snapEpsXZ, long scale)
-    {
-        if (!(snapEpsXZ > 0f))
-        {
-            return 1L;
-        }
-        var k = (long)Math.Round(snapEpsXZ * scale);
-        return Math.Max(1, k);
-    }
-
-    private static Point64 Snap(Point64 p, long snapInt)
-    {
-        if (snapInt <= 1L)
-        {
-            return p;
-        }
-        static long RoundToMultiple(long v, long m)
-        {
-            // nearest multiple of m
-            var half = m >> 1;
-            return v >= 0L ? (v + half) / m * m : (v - half) / m * m;
-        }
-        return new Point64(RoundToMultiple(p.X, snapInt), RoundToMultiple(p.Y, snapInt));
-    }
-
-    private static void EnsureCCW(ref Point64 a, ref Point64 b, ref Point64 c)
-    {
-        var aX = a.X;
-        var aY = a.Y;
-        var cross = (b.X - aX) * (c.Y - aY) - (b.Y - aY) * (c.X - aX);
-        if (cross < 0L)
-        {
-            (b, c) = (c, b);
-        }
-    }
-
-    private static bool OnSegment(in Point64 p, in Point64 a, in Point64 b)
-    {
-        var aX = a.X;
-        var aY = a.Y;
-        var bX = b.X;
-        var bY = b.Y;
-        var pX = p.X;
-        var pY = p.Y;
-        var cross = (bX - aX) * (pY - aY) - (bY - aY) * (pX - aX);
-        if (cross != 0L)
-        {
-            return false;
-        }
-        long minX = Math.Min(aX, bX), maxX = Math.Max(aX, bX);
-        long minY = Math.Min(aY, bY), maxY = Math.Max(aY, bY);
-        return pX >= minX && pX <= maxX && pY >= minY && pY <= maxY;
-    }
-
-    private static double AreaSigned(Path64 p)
-    {
-        long a = 0;
-        var n = p.Count;
-        for (int i = 0, j = n - 1; i < n; j = ++i)
-        {
-            a += p[j].X * p[i].Y - p[i].X * p[j].Y;
-        }
-        return 0.5d * a;
-    }
-
-    private static AABB2 BoundsXZ(Path64 p)
-    {
-        long minX = long.MaxValue, minZ = long.MaxValue, maxX = long.MinValue, maxZ = long.MinValue;
-        var count = p.Count;
-        for (var i = 0; i < count; ++i)
-        {
-            var pt = p[i];
-            var pX = pt.X;
-            var pY = pt.Y;
-            if (pX < minX)
-            {
-                minX = pX;
-            }
-            if (pX > maxX)
-            {
-                maxX = pX;
-            }
-            if (pY < minZ)
-            {
-                minZ = pY;
-            }
-            if (pY > maxZ)
-            {
-                maxZ = pY;
-            }
-        }
-        return new AABB2(minX, minZ, maxX, maxZ);
-    }
-
-    private static Vector2 Centroid(Path64 p, long scale)
-    {
-        double cx = 0, cz = 0;
-        var n = p.Count;
-        for (var i = 0; i < n; ++i)
-        {
-            cx += p[i].X;
-            cz += p[i].Y;
-        }
-        return new Vector2((float)(cx / n / scale), (float)(cz / n / scale));
-    }
-
-    private static bool PointInPolygonXZ(Vector2 p, Path64 path)
-    {
-        var inside = false;
-        var n = path.Count;
-        double px = p.X, pz = p.Y;
-        for (int i = 0, j = n - 1; i < n; j = ++i)
-        {
-            var vi = path[i];
-            var vj = path[j];
-            double xi = vi.X, zi = vi.Y, xj = vj.X, zj = vj.Y;
-            var inter = (zi > pz) != (zj > pz) && px < (xj - xi) * (pz - zi) / ((zj - zi) == 0d ? double.Epsilon : (zj - zi)) + xi;
-            if (inter)
-            {
-                inside = !inside;
-            }
-        }
-        return inside;
     }
 
     // true if min distance (in XZ) from center to triangle <= R
@@ -723,37 +316,7 @@ public static unsafe class CollisionOutlinesExtractor
         var minZ = Math.Min(Math.Min(Math.Min(aaaZ, aabZ), Math.Min(abaZ, abbZ)), Math.Min(Math.Min(baaZ, babZ), Math.Min(bbaZ, bbbZ)));
         var maxZ = Math.Max(Math.Max(Math.Max(aaaZ, aabZ), Math.Max(abaZ, abbZ)), Math.Max(Math.Max(baaZ, babZ), Math.Max(bbaZ, bbbZ)));
 
-        return RectXZIntersectsCircle(minX, minZ, maxX, maxZ, c, r);
-    }
-
-    private static bool RectXZIntersectsCircle(float minX, float minZ, float maxX, float maxZ, in Vector2 c, float r)
-    {
-        var dx = 0f;
-        if (c.X < minX)
-        {
-            dx = minX - c.X;
-        }
-        else if (c.X > maxX)
-        {
-            dx = c.X - maxX;
-        }
-        var dz = 0f;
-        if (c.Y < minZ)
-        {
-            dz = minZ - c.Y;
-        }
-        else if (c.Y > maxZ)
-        {
-            dz = c.Y - maxZ;
-        }
-        return (dx * dx + dz * dz) <= r * r;
-    }
-
-    private readonly struct AABB2(float minX, float minZ, float maxX, float maxZ)
-    {
-        public readonly float MinX = minX, MinZ = minZ, MaxX = maxX, MaxZ = maxZ;
-
-        public bool Contains(AABB2 o) => o.MinX >= MinX && o.MaxX <= MaxX && o.MinZ >= MinZ && o.MaxZ <= MaxZ;
+        return new Bounds3(new(minX, 0f, minZ), new(maxX, 0f, maxZ)).IntersectsXZCircle(c, r);
     }
 }
 
@@ -771,7 +334,7 @@ public sealed unsafe class DebugCollision() : IDisposable
     private BitMask _availableLayers;
     private BitMask _availableMaterials;
 
-    private CollisionOutlinesExtractor.MaterialMatchMode _exportMatchMode = CollisionOutlinesExtractor.MaterialMatchMode.EffectiveMasked;
+    private MaterialMatchMode _exportMatchMode = MaterialMatchMode.EffectiveMasked;
     private float _exportRadiusXZ = 0f; // 0 => whole mesh/streamed
     private bool _exportStrictRadius = true;
     private float _exportSnapEpsXZ = 1e-5f;
@@ -786,18 +349,6 @@ public sealed unsafe class DebugCollision() : IDisposable
         (0, 1), (1, 3), (3, 2), (2, 0),
         (4, 5), (5, 7), (7, 6), (6, 4),
         (0, 4), (1, 5), (2, 6), (3, 7)
-    ];
-
-    private static readonly Vector3[] _boxCorners =
-    [
-        new(-1, -1, -1),
-        new(-1, -1,  1),
-        new(-1,  1, -1),
-        new(-1,  1,  1),
-        new( 1, -1, -1),
-        new( 1, -1,  1),
-        new( 1,  1, -1),
-        new( 1,  1,  1),
     ];
 
     private static readonly Dx11ArenaRenderer.WorldLineLocalSegment[] _boxLocalLines = BuildBoxLocalLines();
@@ -1037,7 +588,7 @@ public sealed unsafe class DebugCollision() : IDisposable
 
     private static float Distance2ProjectedUnitBoxXZ(ref Matrix4x3 world, in Vector2 p)
     {
-        var first = world.TransformCoordinate(_boxCorners[0]);
+        var first = world.TransformCoordinate(ZoneBoxInstance.UnitCorners[0]);
         var minX = first.X;
         var maxX = first.X;
         var minZ = first.Z;
@@ -1045,7 +596,7 @@ public sealed unsafe class DebugCollision() : IDisposable
 
         for (var i = 1; i < 8; ++i)
         {
-            var v = world.TransformCoordinate(_boxCorners[i]);
+            var v = world.TransformCoordinate(ZoneBoxInstance.UnitCorners[i]);
             var vX = v.X;
             var vZ = v.Z;
             minX = Math.Min(minX, vX);
@@ -1065,7 +616,7 @@ public sealed unsafe class DebugCollision() : IDisposable
         return dx * dx + dz * dz;
     }
 
-    private readonly CollisionOutlinesExtractor.MaterialMatchMode[] modes = GeneratedEnumMetadata.Values<CollisionOutlinesExtractor.MaterialMatchMode>();
+    private readonly MaterialMatchMode[] modes = GeneratedEnumMetadata.Values<MaterialMatchMode>();
 
     private void DrawSettings()
     {
@@ -1534,7 +1085,7 @@ public sealed unsafe class DebugCollision() : IDisposable
             // Render vertices in sorted order
             foreach (var (vertex, index, type, _) in vertices)
             {
-                var vertexStr = $"new({vertex.X.ToString("F5", System.Globalization.CultureInfo.InvariantCulture)}f, {vertex.Z.ToString("F5", System.Globalization.CultureInfo.InvariantCulture)}f)";
+                var vertexStr = $"new({CollisionArenaCodeGen.F(vertex.X, 5)}, {CollisionArenaCodeGen.F(vertex.Z, 5)})";
                 using var node2 = _tree.Node2($"[{index}] ({type}): {Vec3Str(vertex)}");
                 if (node2.SelectedOrHovered)
                 {
@@ -1879,7 +1430,7 @@ public sealed unsafe class DebugCollision() : IDisposable
         for (var i = 0; i < 8; ++i)
         {
             var (start, end) = _boxEdges[i];
-            lines[i] = new(_boxCorners[start], _boxCorners[end]);
+            lines[i] = new(ZoneBoxInstance.UnitCorners[start], ZoneBoxInstance.UnitCorners[end]);
         }
         return lines;
     }
@@ -2158,15 +1709,7 @@ public sealed unsafe class DebugCollision() : IDisposable
         }
     }
 
-    private static Vector3 ApplyTransformation(Vector3 vertex, Vector3 translation, Vector3 rotation)
-    {
-        var rotX = rotation.X;
-        var rotY = rotation.Y;
-        var rotZ = rotation.Z;
-        var rotMatrix = Matrix4x4.CreateRotationX(rotX) * Matrix4x4.CreateRotationY(rotY) * Matrix4x4.CreateRotationZ(rotZ);
-        var rotatedVertex = Vector3.Transform(vertex, rotMatrix);
-        return rotatedVertex + translation;
-    }
+    private static Vector3 ApplyTransformation(Vector3 vertex, Vector3 translation, Vector3 rotation) => Vector3.Transform(vertex, ZoneTransform.Compose(translation, rotation, Vector3.One));
 
     private static Angle HeadingDegFromWorld(ref Matrix4x3 world)
     {
@@ -2180,16 +1723,6 @@ public sealed unsafe class DebugCollision() : IDisposable
 
         var rad = MathF.Atan2(x, z);
         return new Angle(rad).Normalized();
-    }
-
-    private static bool TryParseHexU64(string s, out ulong value)
-    {
-        s = (s ?? string.Empty).Trim();
-        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-        {
-            s = s[2..];
-        }
-        return ulong.TryParse(s, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out value);
     }
 
     private static (bool ok, HashSet<ulong> ids) TryParseHexU64List(string s)

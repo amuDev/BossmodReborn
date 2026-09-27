@@ -81,6 +81,91 @@ public sealed class ReplayManager(RotationDatabase rotationDB, string logDirecto
 
     public void SetLogDirectory(string logDirectory) => _logDirectory = logDirectory;
 
+    public string LogDirectory => _logDirectory;
+
+    // open the viewer for a replay at a time: an already parsed one shows at once, a new path is parsed and shown when ready
+    public void ShowReplay(string path, DateTime? time)
+    {
+        foreach (var e in _replayEntries)
+        {
+            if (!e.Disposed && !e.Disposing && e.Path == path)
+            {
+                if (e.Replay.IsCompletedSuccessfully && e.Replay.Result.Ops.Count > 0)
+                {
+                    e.Show(_rotationDB);
+                    if (time is { } t && e.Window != null)
+                    {
+                        e.Window.CurrentTime = t;
+                    }
+                }
+                else
+                {
+                    e.AutoShowWindow = true;
+                    e.InitialTime = time;
+                }
+                return;
+            }
+        }
+        _replayEntries.Add(new(path, true, time));
+    }
+
+    // the boss module the open viewer of a replay is running right now (its arena follows the fight: the editor overlays it)
+    public BossModule? ActiveModule(string path)
+    {
+        foreach (var e in _replayEntries)
+        {
+            if (!e.Disposed && e.Path == path && e.Window is { IsOpen: true } w)
+            {
+                return w.ActiveModule;
+            }
+        }
+        return null;
+    }
+
+    // move an open replay viewer to a time (the zone arena editor keeps its scrub in step with the viewer)
+    public void SetReplayTime(string path, DateTime t)
+    {
+        foreach (var e in _replayEntries)
+        {
+            if (!e.Disposed && e.Path == path && e.Window is { IsOpen: true } w)
+            {
+                w.CurrentTime = t;
+            }
+        }
+    }
+
+    // how many entries LoadedReplays would yield, without the enumeration (tools poll it every frame)
+    public int LoadedReplayCount
+    {
+        get
+        {
+            var n = 0;
+            foreach (var e in _replayEntries)
+            {
+                if (!e.Disposed && e.Replay.IsCompletedSuccessfully && e.Replay.Result.Ops.Count > 0)
+                {
+                    ++n;
+                }
+            }
+            return n;
+        }
+    }
+
+    // parsed replays with their viewer state, for tools that want to reuse an open replay (path, replay, viewer open, viewer time)
+    public IEnumerable<(string path, Replay replay, bool windowOpen, DateTime? currentTime)> LoadedReplays
+    {
+        get
+        {
+            foreach (var e in _replayEntries)
+            {
+                if (!e.Disposed && e.Replay.IsCompletedSuccessfully && e.Replay.Result.Ops.Count > 0)
+                {
+                    yield return (e.Path, e.Replay.Result, e.Window?.IsOpen ?? false, e.Window?.CurrentTime);
+                }
+            }
+        }
+    }
+
     public void Dispose()
     {
         foreach (var e in _analysisEntries)

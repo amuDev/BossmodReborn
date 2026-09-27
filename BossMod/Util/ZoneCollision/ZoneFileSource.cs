@@ -10,5 +10,5 @@ public interface IZoneFileSource
 public sealed class LuminaZoneFileSource(Lumina.GameData data) : IZoneFileSource
 {
     public bool Exists(string path) => data.FileExists(path);
-    public byte[]? Read(string path) => data.FileExists(path) ? data.GetFile<Lumina.Data.FileResource>(path)?.Data : null;
+    public byte[]? Read(string path) => data.GetFile<Lumina.Data.FileResource>(path)?.Data; // null for a path that is not in the indices
 }

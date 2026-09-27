@@ -1,6 +1,5 @@
 using Clipper2Lib;
 using Dalamud.Bindings.ImGui;
-using System.Runtime.InteropServices;
 
 namespace BossMod;
 
@@ -13,6 +12,7 @@ public sealed partial class ZoneArenaEditorWindow
     private Vector3 _anchorVertex;
     private bool _anchorVertexValid;
     private readonly List<int> _pickHits = [];
+    private readonly List<int> _scratchHits = []; // one-shot picks that must not disturb the hover stack
     private int _pickCycle;
     private Vector3 _snapVertex;
     private bool _snapValid;
@@ -33,6 +33,7 @@ public sealed partial class ZoneArenaEditorWindow
     private bool _showMarkers = true;
     private bool _showPlayer = true;       // player position + facing on the canvas while standing in the loaded zone
     private bool _showWorldPreview = true; // result contours drawn in the 3D world while standing in the loaded zone
+    private int _worldPreviewMode;         // 0 = the simplified contours, 1 = the ArenaBoundsCustom the snippet builds (framework post-processing applied)
     private float _worldPreviewLift = 0.2f;
     private bool _selectFloorOnly = true; // rect/brush add only floor-material (or floor-mesh) triangles
     private bool _selectLayerOnly = true; // rect/brush act only on the Tab layer under the cursor at the start of the drag/stroke
@@ -45,6 +46,49 @@ public sealed partial class ZoneArenaEditorWindow
     private int _hoverDeletedVertex = -1; // vertex tool: hovered deleted vertex (index into pipeline.DeletedVertices)
     private bool _showRawOutline;
     private int _trianglesDrawn;
+    private bool _showFloorPieces = true;
+    private readonly Dictionary<int, MeshDraw> _meshDrawCache = []; // per-mesh triangle classes (floor / wall / other) under the floor settings, computed once per settings change instead of per frame, and the visible triangles in screen space under the last view
+    private UICanvas2D.ViewState _meshView;
+    private int _meshViewGen;       // bumped when the view changes; a mesh's screen-space record is reused while it carries the current value
+    private int _meshDrawFrame;
+    private int _meshRecordEntries; // record capacity held over all meshes, so records of meshes that left the view are released in a sweep
+    private readonly Dictionary<int, (int pieces, short[]? piece)> _meshPieceCache = []; // floor piece index per triangle (-1 = none) per mesh, null when no piece overlaps the mesh
+    private string _floorSettingsKey = "";
+    private uint[] _pieceFills = []; // fill per floor piece at the scrub time (gone pieces faded), rebuilt when the model or the scrub time changes
+    private ZoneSceneModel? _pieceFillsModel;
+    private ZoneSceneTimelineFile? _pieceFillsTimeline;
+    private float _pieceFillsT = float.NaN;
+    private readonly Dictionary<int, int> _popByMarker = []; // pop range marker -> pop point, per model
+    private ZoneSceneModel? _popByMarkerModel;
+    private int[] _meshSelectedCounts = [];
+    private int _meshSelectedCountsVersion = -1;
+    private readonly Dictionary<string, Vector3?> _nodePositionCache = [];
+    private readonly List<WPos> _relContour = []; // scratch for the bounds preview contours
+
+    // triangle classes of one mesh under (floor settings, forced floor, excluded), the same triangles bucketed by class, and the record of the
+    // triangles visible under one view with their screen-space vertices
+    private sealed class MeshDraw
+    {
+        public string Key = "";
+        public bool Forced, Excluded;
+        public int TriStart;
+        public byte[] Cls = [];       // 0 other, 1 floor, 2 wall per local triangle
+        public int[] Order = [];      // local triangle indices bucketed floor | other | wall, ascending inside a bucket
+        public readonly int[] BucketStart = new int[4];
+        public readonly float[] BucketMinX = new float[3], BucketMinZ = new float[3], BucketMaxX = new float[3], BucketMaxZ = new float[3];
+        public bool Contained;        // every triangle lies inside the mesh bounds (no NaN vertex): a mesh or bucket inside the view needs no per-triangle cull
+
+        public int ViewGen = -1;
+        public bool Edges;            // the record holds every visible triangle (edges are drawn), else the floor ones only
+        public bool Ordered;          // entries carry their ordinal among the visible triangles, so a triangle budget cut can be replayed
+        public bool Complete;         // the whole mesh was scanned; else the scan stopped at the budget after Processed visible triangles
+        public int Processed;
+        public int Count;
+        public int[] Local = [];
+        public int[] Ordinal = [];
+        public Vector2[] Verts = [];  // three per entry
+        public int LastFrame;
+    }
 
     public sealed class ManualPolygon
     {
@@ -63,25 +107,13 @@ public sealed partial class ZoneArenaEditorWindow
         return _scene.IsMeshEnabled(meshIndex) && (meshIndex >= _meshModes.Count || _meshModes[meshIndex] != MeshMode.Exclude);
     }
 
-    private List<Path64> ManualUnionPaths()
+    // the closed manual polygons of one kind (cut out of / unioned into the result) as clipper paths
+    private List<Path64> ManualPaths(bool cut)
     {
         List<Path64> result = [];
         foreach (var p in _manualPolygons)
         {
-            if (!p.Difference && p.Vertices.Count >= 3)
-            {
-                result.Add(ToPath(p.Vertices));
-            }
-        }
-        return result;
-    }
-
-    private List<Path64> ManualCutPaths()
-    {
-        List<Path64> result = [];
-        foreach (var p in _manualPolygons)
-        {
-            if (p.Difference && p.Vertices.Count >= 3)
+            if (p.Difference == cut && p.Vertices.Count >= 3)
             {
                 result.Add(ToPath(p.Vertices));
             }
@@ -125,17 +157,29 @@ public sealed partial class ZoneArenaEditorWindow
         _trianglesDrawn = 0;
         if (_scene != null && _session != null)
         {
+            DrawAreaOverview();
             DrawMeshes();
+            DrawFloorPieces();
             DrawSelection();
             DrawBoxes();
             DrawSeals();
+            DrawTriggers();
+            DrawExitLinks();
             DrawMarkers();
+            DrawObjectHighlight();
             DrawResult();
+            DrawCoverageOutliers();
+            DrawSpawnOverlay();
+            DrawPlayerPaths();
+            DrawBossOverlay();
+            DrawModuleArena();
+            DrawBoundsPreview();
             DrawVertexTool();
             DrawManualPolygons();
             DrawCentre();
             DrawPlayer();
             HandleCanvasInput();
+            DrawObjectPopup();
             DrawHover();
         }
         else
@@ -145,63 +189,477 @@ public sealed partial class ZoneArenaEditorWindow
         _canvas.End();
     }
 
+    // the floor piece under each triangle of a mesh, once per model; null when no piece overlaps the mesh
+    private short[]? MeshPieces(int m)
+    {
+        var model = _session!.Model;
+        if (_meshPieceCache.TryGetValue(m, out var e) && e.pieces == model.FloorPieces.Count)
+        {
+            return e.piece;
+        }
+        var scene = _scene!;
+        var mesh = scene.Meshes[m];
+        var b = mesh.WorldBounds;
+        short[]? r = null;
+        if (model.FloorPieces.Exists(p => p.Bounds.Max.X >= b.Min.X && p.Bounds.Min.X <= b.Max.X && p.Bounds.Max.Z >= b.Min.Z && p.Bounds.Min.Z <= b.Max.Z))
+        {
+            var tris = scene.Triangles.Span;
+            r = new short[mesh.TriCount];
+            for (var i = 0; i < mesh.TriCount; ++i)
+            {
+                r[i] = (short)model.FloorPieceAt(tris[mesh.TriStart + i].Centroid);
+            }
+        }
+        _meshPieceCache[m] = (model.FloorPieces.Count, r);
+        return r;
+    }
+
+    // one hue per floor group, pieces of a group a step apart; gone pieces (at the scrub time) fade
+    private uint[] PieceFills()
+    {
+        var model = _session!.Model;
+        if (_pieceFillsModel == model && _pieceFillsTimeline == _timeline && _pieceFillsT == _timelineT && _pieceFills.Length == model.FloorPieces.Count)
+        {
+            return _pieceFills;
+        }
+        var present = _timeline?.PiecesPresentAt(_timelineT);
+        var fills = new uint[model.FloorPieces.Count];
+        for (var i = 0; i < fills.Length; ++i)
+        {
+            var p = model.FloorPieces[i];
+            var indexInGroup = model.FloorGroups[p.Group].Pieces.IndexOf(i);
+            fills[i] = IndexColor(p.Group, 0.85f, 0.75f + 0.25f * ((indexInGroup % 3) / 2f), ZoneSceneTimelineFile.PieceGone(present, p) ? 0.10f : 0.42f, 0.15f);
+        }
+        _pieceFills = fills;
+        _pieceFillsModel = model;
+        _pieceFillsTimeline = _timeline;
+        _pieceFillsT = _timelineT;
+        return fills;
+    }
+
+    // a distinct hue per index (golden ratio steps) as a packed colour
+    private static uint IndexColor(int index, float sat, float val, float alpha, float hueOffset = 0f)
+    {
+        var rgb = HsvToRgb((index * 0.618034f + hueOffset) % 1f, sat, val);
+        return ImGui.ColorConvertFloat4ToU32(new Vector4(rgb, alpha));
+    }
+
+    private Dictionary<int, int> PopByMarker()
+    {
+        var model = _session!.Model;
+        if (_popByMarkerModel != model)
+        {
+            _popByMarker.Clear();
+            for (var i = 0; i < model.PopPoints.Count; ++i)
+            {
+                _popByMarker[model.PopPoints[i].MarkerIndex] = i;
+            }
+            _popByMarkerModel = model;
+        }
+        return _popByMarker;
+    }
+
+    // everything the canvas remembers about the loaded scene: hover, anchors, strokes and selections; a new zone starts clean
+    private void ResetCanvasState()
+    {
+        _hoverTri = _anchorTri = -1;
+        _anchorVertexValid = false;
+        _pickHits.Clear();
+        _scratchHits.Clear();
+        _pickCycle = 0;
+        _snapValid = false;
+        _hoveredSeal = _hoverBox = -1;
+        _sealBoxes.Clear();
+        _draggingCentre = _brushStroke = false;
+        _layerRefValid = false;
+        _hoverVertexPoly = _hoverVertexContour = _hoverVertexIndex = _hoverDeletedVertex = -1;
+        _hoverObject = _selectedObject = _popupObject = ObjectRef.None;
+        _openObjectPopup = false;
+        _stateEdit = 0;
+    }
+
+    private void InvalidateSceneCaches()
+    {
+        _meshDrawCache.Clear();
+        _meshRecordEntries = 0;
+        ++_meshViewGen;
+        _meshPieceCache.Clear();
+        _meshSelectedCountsVersion = -1;
+        _nodePositionCache.Clear();
+    }
+
+    private void RefreshPicker()
+    {
+        if (_picker == null || _picker.Scene != _scene)
+        {
+            _picker = new(_scene!);
+        }
+        else
+        {
+            _picker.Refresh();
+        }
+    }
+
+    // the floor settings that decide a triangle's class, once per frame; the previous string is kept while it reads the same so the per-mesh compares are reference hits
+    private string FloorSettingsKey()
+    {
+        var s = _session!.Settings;
+        var key = $"{string.Join(",", s.FloorMaterials)}|{s.FloorMatchMode}|{s.MaxSlopeDeg}|{s.ExcludeUnwalkableMaterials}";
+        if (key != _floorSettingsKey)
+        {
+            _floorSettingsKey = key;
+        }
+        return _floorSettingsKey;
+    }
+
+    private MeshDraw MeshClasses(int m, string key, bool forcedFloor, bool excluded)
+    {
+        var scene = _scene!;
+        var mesh = scene.Meshes[m];
+        if (_meshDrawCache.TryGetValue(m, out var d))
+        {
+            if (d.Forced == forcedFloor && d.Excluded == excluded && ReferenceEquals(d.Key, key) && d.TriStart == mesh.TriStart && d.Cls.Length == mesh.TriCount)
+            {
+                return d;
+            }
+        }
+        else
+        {
+            d = _meshDrawCache[m] = new();
+        }
+        var settings = _session!.Settings;
+        var tris = scene.Triangles.Span;
+        var minNormalY = settings.MinNormalY;
+        var n = mesh.TriCount;
+        var cls = new byte[n];
+        Span<int> counts = [0, 0, 0];
+        for (var i = 0; i < n; ++i)
+        {
+            ref readonly var t = ref tris[mesh.TriStart + i];
+            var c = t.NormalY < minNormalY ? (byte)2 : (forcedFloor || settings.FloorMatches(t)) && !excluded ? (byte)1 : (byte)0;
+            cls[i] = c;
+            ++counts[c];
+        }
+        // buckets in the order floor (1), other (0), wall (2)
+        Span<int> bucketOf = [1, 0, 2];
+        Span<int> fill = [0, counts[1], counts[1] + counts[0]];
+        for (var b = 0; b < 3; ++b)
+        {
+            d.BucketStart[b] = fill[b];
+            d.BucketMinX[b] = d.BucketMinZ[b] = float.MaxValue;
+            d.BucketMaxX[b] = d.BucketMaxZ[b] = float.MinValue;
+        }
+        d.BucketStart[3] = n;
+        var order = new int[n];
+        var mb = mesh.WorldBounds;
+        var contained = true;
+        for (var i = 0; i < n; ++i)
+        {
+            ref readonly var t = ref tris[mesh.TriStart + i];
+            var b = bucketOf[cls[i]];
+            order[fill[b]++] = i;
+            var minX = MathF.Min(t.A.X, MathF.Min(t.B.X, t.C.X));
+            var maxX = MathF.Max(t.A.X, MathF.Max(t.B.X, t.C.X));
+            var minZ = MathF.Min(t.A.Z, MathF.Min(t.B.Z, t.C.Z));
+            var maxZ = MathF.Max(t.A.Z, MathF.Max(t.B.Z, t.C.Z));
+            contained &= minX >= mb.Min.X && maxX <= mb.Max.X && minZ >= mb.Min.Z && maxZ <= mb.Max.Z;
+            if (minX < d.BucketMinX[b])
+            {
+                d.BucketMinX[b] = minX;
+            }
+            if (maxX > d.BucketMaxX[b])
+            {
+                d.BucketMaxX[b] = maxX;
+            }
+            if (minZ < d.BucketMinZ[b])
+            {
+                d.BucketMinZ[b] = minZ;
+            }
+            if (maxZ > d.BucketMaxZ[b])
+            {
+                d.BucketMaxZ[b] = maxZ;
+            }
+        }
+        d.Key = key;
+        d.Forced = forcedFloor;
+        d.Excluded = excluded;
+        d.TriStart = mesh.TriStart;
+        d.Cls = cls;
+        d.Order = order;
+        d.Contained = contained;
+        d.ViewGen = -1;
+        return d;
+    }
+
+    // exactly the per-triangle view test: the XZ extent of the three vertices against the view
+    private bool TriangleVisible(in WorldTriangle t)
+    {
+        var minX = MathF.Min(t.A.X, MathF.Min(t.B.X, t.C.X));
+        var maxX = MathF.Max(t.A.X, MathF.Max(t.B.X, t.C.X));
+        var minZ = MathF.Min(t.A.Z, MathF.Min(t.B.Z, t.C.Z));
+        var maxZ = MathF.Max(t.A.Z, MathF.Max(t.B.Z, t.C.Z));
+        return _canvas.IsVisible(minX, minZ, maxX, maxZ);
+    }
+
+    private void AddRecordEntry(MeshDraw d, int local, int ordinal, in WorldTriangle t)
+    {
+        var e = d.Count;
+        if (e == d.Local.Length)
+        {
+            var cap = Math.Max(64, e * 2);
+            _meshRecordEntries += cap - e;
+            Array.Resize(ref d.Local, cap);
+            Array.Resize(ref d.Ordinal, cap);
+            Array.Resize(ref d.Verts, cap * 3);
+        }
+        d.Local[e] = local;
+        d.Ordinal[e] = ordinal;
+        d.Verts[3 * e] = _canvas.ToScreen(t.A);
+        d.Verts[3 * e + 1] = _canvas.ToScreen(t.B);
+        d.Verts[3 * e + 2] = _canvas.ToScreen(t.C);
+        d.Count = e + 1;
+    }
+
+    // the visible triangles of a mesh under the current view, in mesh order, as far as the triangle budget lets the mesh go (allowance = visible
+    // triangles it may still process). Without edges only floor triangles are drawn: when the budget cannot cut inside the mesh the floor bucket is
+    // walked alone and the other buckets are only counted (by their bounds where those decide it)
+    private void BuildMeshRecord(MeshDraw d, ZoneMeshInstance mesh, bool edges, int allowance)
+    {
+        var tris = _scene!.Triangles.Span;
+        var mb = mesh.WorldBounds;
+        var inside = d.Contained && _canvas.IsInsideView(mb.Min.X, mb.Min.Z, mb.Max.X, mb.Max.Z);
+        var n = mesh.TriCount;
+        d.ViewGen = _meshViewGen;
+        d.Edges = edges;
+        d.Count = 0;
+        if (!edges && n <= allowance)
+        {
+            d.Ordered = false;
+            var visible = 0;
+            for (var b = 0; b < 3; ++b)
+            {
+                var start = d.BucketStart[b];
+                var end = d.BucketStart[b + 1];
+                if (start == end || !_canvas.IsVisible(d.BucketMinX[b], d.BucketMinZ[b], d.BucketMaxX[b], d.BucketMaxZ[b]))
+                {
+                    continue; // every triangle of the bucket fails the same test
+                }
+                var all = inside || d.Contained && _canvas.IsInsideView(d.BucketMinX[b], d.BucketMinZ[b], d.BucketMaxX[b], d.BucketMaxZ[b]);
+                if (all && b != 0)
+                {
+                    visible += end - start;
+                    continue;
+                }
+                for (var k = start; k < end; ++k)
+                {
+                    var local = d.Order[k];
+                    ref readonly var t = ref tris[mesh.TriStart + local];
+                    if (all || TriangleVisible(t))
+                    {
+                        ++visible;
+                        if (b == 0)
+                        {
+                            AddRecordEntry(d, local, 0, t);
+                        }
+                    }
+                }
+            }
+            d.Processed = visible;
+            d.Complete = true;
+            return;
+        }
+        d.Ordered = true;
+        d.Complete = true;
+        var count = 0;
+        for (var local = 0; local < n; ++local)
+        {
+            ref readonly var t = ref tris[mesh.TriStart + local];
+            if (!inside && !TriangleVisible(t))
+            {
+                continue;
+            }
+            if (edges || d.Cls[local] == 1)
+            {
+                AddRecordEntry(d, local, count, t);
+            }
+            if (++count >= allowance)
+            {
+                d.Complete = local == n - 1;
+                break;
+            }
+        }
+        d.Processed = count;
+    }
+
+    // records of meshes that were not drawn this frame are dropped once the held capacity outgrows a few budgets
+    private void SweepMeshRecords()
+    {
+        if (_meshRecordEntries <= 4 * TriangleBudget)
+        {
+            return;
+        }
+        var total = 0;
+        foreach (var d in _meshDrawCache.Values)
+        {
+            if (d.LastFrame != _meshDrawFrame)
+            {
+                d.Local = [];
+                d.Ordinal = [];
+                d.Verts = [];
+                d.Count = 0;
+                d.ViewGen = -1;
+            }
+            total += d.Local.Length;
+        }
+        _meshRecordEntries = total;
+    }
+
+    // selected triangles per mesh, recounted only when the selection changes
+    private int MeshSelectedCount(int m)
+    {
+        var scene = _scene!;
+        if (_meshSelectedCountsVersion != _selection.Version || _meshSelectedCounts.Length != scene.Meshes.Count)
+        {
+            _meshSelectedCounts = new int[scene.Meshes.Count];
+            var tris = scene.Triangles.Span;
+            foreach (var t in _selection.Selected)
+            {
+                if (t >= 0 && t < tris.Length)
+                {
+                    ++_meshSelectedCounts[tris[t].MeshIndex];
+                }
+            }
+            _meshSelectedCountsVersion = _selection.Version;
+        }
+        return _meshSelectedCounts[m];
+    }
+
     private void DrawMeshes()
     {
         var scene = _scene!;
-        var tris = scene.Triangles.Span;
-        var settings = _session!.Settings;
-        var minNormalY = settings.MinNormalY;
+        var session = _session!;
         var floorFill = UICanvas2D.WithAlpha(Colors.CollisionColor1, 0x28);
         var floorEdge = UICanvas2D.WithAlpha(Colors.CollisionColor2, 0x60);
         var otherEdge = UICanvas2D.WithAlpha(Colors.Shadows, 0x70);
         var wallEdge = UICanvas2D.WithAlpha(Colors.CollisionColor3, 0x50);
         var drawEdges = _canvas.Zoom >= 6f;
         var lod = _canvas.Zoom < 2f;
+        var settingsKey = FloorSettingsKey();
+        var pieceFills = _showFloorPieces && session.Model.FloorPieces.Count > 0 ? PieceFills() : null;
+        var view = _canvas.View;
+        var viewChanged = view != _meshView;
+        if (viewChanged)
+        {
+            _meshView = view;
+            ++_meshViewGen;
+        }
+        ++_meshDrawFrame;
         for (var m = 0; m < scene.Meshes.Count; ++m)
         {
             var mesh = scene.Meshes[m];
-            if (mesh.TriCount == 0 || !scene.IsMeshEnabled(m) || !_canvas.IsVisible(mesh.WorldBounds.Min, mesh.WorldBounds.Max))
+            if (mesh.TriCount == 0 || !_canvas.IsVisible(mesh.WorldBounds.Min, mesh.WorldBounds.Max))
             {
                 continue;
             }
+            if (!scene.IsMeshEnabled(m))
+            {
+                // the instance exists but its collision is removed in the active scene (a door / seal controlled by an event object)
+                if (_ghostInactive && scene.IsMeshPlaced(m))
+                {
+                    DashedRect(mesh.WorldBounds, UICanvas2D.WithAlpha(Colors.Shadows, 0x70));
+                }
+                continue;
+            }
             var excluded = m < _meshModes.Count && _meshModes[m] == MeshMode.Exclude;
-            var forcedFloor = _session.FloorMeshes.Contains(m);
+            var forcedFloor = session.FloorMeshes.Contains(m);
             if (lod || !_showAllTriangles || _trianglesDrawn > TriangleBudget)
             {
                 _canvas.Rect(mesh.WorldBounds.Min, mesh.WorldBounds.Max, excluded ? UICanvas2D.WithAlpha(Colors.Danger, 0x40) : UICanvas2D.WithAlpha(Colors.Shadows, 0x60));
                 continue;
             }
-            var end = mesh.TriStart + mesh.TriCount;
-            for (var i = mesh.TriStart; i < end; ++i)
+            var d = MeshClasses(m, settingsKey, forcedFloor, excluded);
+            var pieces = pieceFills != null ? MeshPieces(m) : null;
+            // the mesh processes visible triangles until the running count passes the budget: at most this many
+            var allowance = TriangleBudget + 1 - _trianglesDrawn;
+            var reusable = d.ViewGen == _meshViewGen && d.Edges == drawEdges && (d.Complete ? d.Ordered || d.Processed <= allowance : d.Processed >= allowance);
+            if (!reusable)
             {
-                ref readonly var t = ref tris[i];
-                var minX = MathF.Min(t.A.X, MathF.Min(t.B.X, t.C.X));
-                var maxX = MathF.Max(t.A.X, MathF.Max(t.B.X, t.C.X));
-                var minZ = MathF.Min(t.A.Z, MathF.Min(t.B.Z, t.C.Z));
-                var maxZ = MathF.Max(t.A.Z, MathF.Max(t.B.Z, t.C.Z));
-                if (!_canvas.IsVisible(minX, minZ, maxX, maxZ))
+                BuildMeshRecord(d, mesh, drawEdges, allowance);
+            }
+            d.LastFrame = _meshDrawFrame;
+            var processed = Math.Min(d.Processed, allowance);
+            _trianglesDrawn += processed;
+            var entries = d.Count;
+            if (d.Ordered && processed < d.Processed)
+            {
+                // the budget cuts earlier than the record: the entries among the first 'processed' visible triangles
+                var lo = 0;
+                while (lo < entries)
                 {
-                    continue;
-                }
-                ++_trianglesDrawn;
-                var floor = t.NormalY >= minNormalY && (forcedFloor || settings.FloorMatches(t));
-                if (floor && !excluded)
-                {
-                    _canvas.TriangleFilled(t.A, t.B, t.C, floorFill);
-                    if (drawEdges)
+                    var mid = (lo + entries) >> 1;
+                    if (d.Ordinal[mid] < processed)
                     {
-                        _canvas.Triangle(t.A, t.B, t.C, floorEdge);
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        entries = mid;
                     }
                 }
-                else if (drawEdges)
+            }
+            ReadOnlySpan<Vector2> verts = d.Verts;
+            if (drawEdges)
+            {
+                // fills and edges interleave in mesh order: translucent edges and fills of neighbouring triangles overlap, so the order is part of the picture
+                for (var e = 0; e < entries; ++e)
                 {
-                    _canvas.Triangle(t.A, t.B, t.C, t.NormalY < minNormalY ? wallEdge : otherEdge);
-                }
-                if (_trianglesDrawn > TriangleBudget)
-                {
-                    break;
+                    var local = d.Local[e];
+                    var c = d.Cls[local];
+                    var va = verts[3 * e];
+                    var vb = verts[3 * e + 1];
+                    var vc = verts[3 * e + 2];
+                    if (c == 1)
+                    {
+                        var piece = pieces != null ? pieces[local] : -1;
+                        _canvas.ScreenTriangleFilled(va, vb, vc, piece >= 0 ? pieceFills![piece] : floorFill);
+                        _canvas.ScreenTriangle(va, vb, vc, floorEdge);
+                    }
+                    else
+                    {
+                        _canvas.ScreenTriangle(va, vb, vc, c == 2 ? wallEdge : otherEdge);
+                    }
                 }
             }
+            else if (pieces == null)
+            {
+                _canvas.ScreenTrianglesFilled(verts[..(3 * entries)], floorFill);
+            }
+            else
+            {
+                // runs of one fill, in mesh order
+                var runStart = 0;
+                var runColor = 0u;
+                for (var e = 0; e < entries; ++e)
+                {
+                    var piece = pieces[d.Local[e]];
+                    var color = piece >= 0 ? pieceFills![piece] : floorFill;
+                    if (e == 0)
+                    {
+                        runColor = color;
+                    }
+                    else if (color != runColor)
+                    {
+                        _canvas.ScreenTrianglesFilled(verts[(3 * runStart)..(3 * e)], runColor);
+                        runStart = e;
+                        runColor = color;
+                    }
+                }
+                _canvas.ScreenTrianglesFilled(verts[(3 * runStart)..(3 * entries)], runColor);
+            }
+        }
+        if (viewChanged)
+        {
+            SweepMeshRecords();
         }
     }
 
@@ -211,40 +669,26 @@ public sealed partial class ZoneArenaEditorWindow
         {
             return;
         }
-        var tris = _scene!.Triangles.Span;
-        var selected = UICanvas2D.WithAlpha(Colors.Safe, 0x70);
-        var excluded = UICanvas2D.WithAlpha(Colors.Danger, 0x50);
-        foreach (var i in _selection.Selected)
+        FillTriangles(_selection.Selected, UICanvas2D.WithAlpha(Colors.Safe, 0x70));
+        FillTriangles(_session!.LastAutoResult, UICanvas2D.WithAlpha(Colors.Danger, 0x50), _selection.Selected);
+        // rim slopes the last recompute extended the floor across (only the part inside the rim band ends up in the polygon)
+        FillTriangles(_session.RimTriangles, UICanvas2D.WithAlpha(Colors.Vulnerable, 0x50));
+    }
+
+    private void FillTriangles(HashSet<int> tris, uint color, HashSet<int>? skip = null)
+    {
+        var span = _scene!.Triangles.Span;
+        foreach (var i in tris)
         {
-            ref readonly var t = ref tris[i];
-            var b = t.Bounds;
-            if (_canvas.IsVisible(b.Min, b.Max))
-            {
-                _canvas.TriangleFilled(t.A, t.B, t.C, selected);
-            }
-        }
-        foreach (var i in _session!.LastAutoResult)
-        {
-            if (_selection.Selected.Contains(i))
+            if (skip != null && skip.Contains(i))
             {
                 continue;
             }
-            ref readonly var t = ref tris[i];
+            ref readonly var t = ref span[i];
             var b = t.Bounds;
             if (_canvas.IsVisible(b.Min, b.Max))
             {
-                _canvas.TriangleFilled(t.A, t.B, t.C, excluded);
-            }
-        }
-        // rim slopes the last recompute extended the floor across (only the part inside the rim band ends up in the polygon)
-        var rim = UICanvas2D.WithAlpha(Colors.Vulnerable, 0x50);
-        foreach (var i in _session.RimTriangles)
-        {
-            ref readonly var t = ref tris[i];
-            var b = t.Bounds;
-            if (_canvas.IsVisible(b.Min, b.Max))
-            {
-                _canvas.TriangleFilled(t.A, t.B, t.C, rim);
+                _canvas.TriangleFilled(t.A, t.B, t.C, color);
             }
         }
     }
@@ -271,43 +715,64 @@ public sealed partial class ZoneArenaEditorWindow
         for (var b = 0; b < scene.Boxes.Count; ++b)
         {
             var box = scene.Boxes[b];
-            if (!scene.IsBoxEnabled(b) || _sealBoxes.Contains(b) || box.Kind != LgbColliderKind.Box || !_canvas.IsVisible(box.WorldBounds.Min, box.WorldBounds.Max))
+            if (_sealBoxes.Contains(b) || box.Kind != LgbColliderKind.Box || !_canvas.IsVisible(box.WorldBounds.Min, box.WorldBounds.Max))
             {
+                continue;
+            }
+            if (!scene.IsBoxEnabled(b))
+            {
+                if (_ghostInactive && scene.IsBoxPlaced(b))
+                {
+                    BoxTop(box.Corners, UICanvas2D.WithAlpha(Colors.Shadows, 0x90), 1f, true);
+                }
                 continue;
             }
             var c = box.Corners;
             var hovered = b == _hoverBox;
             if (s.BoxIsFloor(box))
             {
-                var selected = session.SelectedFloorBoxes.Contains(b);
-                // top face: corners 2,3,7,6 of the unit cube (+Y)
-                _canvas.TriangleFilled(c[2], c[3], c[7], selected ? selectedFill : floorFill);
-                _canvas.TriangleFilled(c[2], c[7], c[6], selected ? selectedFill : floorFill);
-                DrawBoxOutline(c, hovered ? Colors.PlayerInteresting : floorEdge, hovered ? 2f : 1f);
+                BoxTopFill(c, session.SelectedFloorBoxes.Contains(b) ? selectedFill : floorFill);
+                BoxTop(c, hovered ? Colors.PlayerInteresting : floorEdge, hovered ? 2f : 1f);
             }
             else if (s.BoxIsObstacle(box))
             {
                 var ignored = session.IgnoredBoxes.Contains(b);
                 if (!ignored)
                 {
-                    _canvas.TriangleFilled(c[2], c[3], c[7], obstacleFill);
-                    _canvas.TriangleFilled(c[2], c[7], c[6], obstacleFill);
+                    BoxTopFill(c, obstacleFill);
                 }
-                DrawBoxOutline(c, hovered ? Colors.PlayerInteresting : ignored ? ignoredEdge : obstacleEdge, hovered ? 2f : 1f);
+                BoxTop(c, hovered ? Colors.PlayerInteresting : ignored ? ignoredEdge : obstacleEdge, hovered ? 2f : 1f);
             }
             else
             {
-                DrawBoxOutline(c, hovered ? Colors.PlayerInteresting : otherEdge, hovered ? 2f : 1f);
+                BoxTop(c, hovered ? Colors.PlayerInteresting : otherEdge, hovered ? 2f : 1f);
             }
         }
     }
 
-    private void DrawBoxOutline(Vector3[] c, uint color, float thickness)
+    // the top face of a box collider: corners 2,3,7,6 of the unit cube (+Y)
+    private void BoxTop(Vector3[] c, uint color, float thickness, bool dashed = false)
     {
-        _canvas.Line(c[2], c[3], color, thickness);
-        _canvas.Line(c[3], c[7], color, thickness);
-        _canvas.Line(c[7], c[6], color, thickness);
-        _canvas.Line(c[6], c[2], color, thickness);
+        if (dashed)
+        {
+            DashedLine(c[2], c[3], color, thickness);
+            DashedLine(c[3], c[7], color, thickness);
+            DashedLine(c[7], c[6], color, thickness);
+            DashedLine(c[6], c[2], color, thickness);
+        }
+        else
+        {
+            _canvas.Line(c[2], c[3], color, thickness);
+            _canvas.Line(c[3], c[7], color, thickness);
+            _canvas.Line(c[7], c[6], color, thickness);
+            _canvas.Line(c[6], c[2], color, thickness);
+        }
+    }
+
+    private void BoxTopFill(Vector3[] c, uint color)
+    {
+        _canvas.TriangleFilled(c[2], c[3], c[7], color);
+        _canvas.TriangleFilled(c[2], c[7], c[6], color);
     }
 
     // the box under the cursor: enabled, not a seal, XZ hull contains the point; the smallest footprint wins so the model box inside a wall box is reachable
@@ -327,7 +792,7 @@ public sealed partial class ZoneArenaEditorWindow
             {
                 continue;
             }
-            var hull = BoxFootprintOps.BoxFootprint(box.Corners, 0f);
+            var hull = box.FootprintXZ;
             if (hull.Count < 3 || Clipper.PointInPolygon(new Point64((long)Math.Round(mw.X * BoxFootprintOps.DefaultScale), (long)Math.Round(mw.Z * BoxFootprintOps.DefaultScale)), hull) == PointInPolygonResult.IsOutside)
             {
                 continue;
@@ -369,7 +834,7 @@ public sealed partial class ZoneArenaEditorWindow
         var s = _session!.Settings;
         var box = scene.Boxes[b];
         var role = s.BoxIsFloor(box) ? (_session.SelectedFloorBoxes.Contains(b) ? "floor box (selected)" : "floor box") : s.BoxIsObstacle(box) ? (_session.IgnoredBoxes.Contains(b) ? "obstacle box (ignored)" : "obstacle box (cut)") : "box (not floor, not in the obstacle material list)";
-        return $"{role}: material 0x{box.MatValue:X}/0x{box.MatMask:X} {(box.IsAnalytic ? "model collider (BgPart analytic)" : "CollisionBox instance")}\nlayout 0x{box.LayoutObjectId:X16} layer '{scene.Layers[box.LayerIndex].Name}'\ncentre ({box.Center.X:f2}, {box.Center.Y:f2}, {box.Center.Z:f2}) half ({box.HalfExtents.X:f2}, {box.HalfExtents.Y:f2}, {box.HalfExtents.Z:f2}) y {box.WorldBounds.Min.Y:f1}..{box.WorldBounds.Max.Y:f1}\nB toggles cut/ignored (floor box: selected)";
+        return $"{role}: material 0x{box.MatValue:X}/0x{box.MatMask:X} {(box.IsAnalytic ? "model collider (BgPart analytic)" : "CollisionBox instance")}\nlayout 0x{box.LayoutObjectId:X16} layer '{scene.Layers[box.LayerIndex].Name}'\ncentre ({box.Center.X:f2}, {box.Center.Y:f2}, {box.Center.Z:f2}) half ({box.HalfExtents.X:f2}, {box.HalfExtents.Y:f2}, {box.HalfExtents.Z:f2}) y {box.WorldBounds.Min.Y:f1}..{box.WorldBounds.Max.Y:f1}\nB toggles cut/ignored (floor box: selected); a Pick click does the same when no triangle is under the cursor";
     }
 
     private void DrawMarkers()
@@ -380,26 +845,97 @@ public sealed partial class ZoneArenaEditorWindow
         }
         var scene = _scene!;
         var session = _session!;
+        var model = session.Model;
+        var popByMarker = PopByMarker();
         for (var i = 0; i < scene.Markers.Count; ++i)
         {
             var m = scene.Markers[i];
-            if (!scene.Layers[m.LayerIndex].Enabled || !_canvas.IsVisible(m.Position.X - 1f, m.Position.Z - 1f, m.Position.X + 1f, m.Position.Z + 1f))
+            if (m.IsTrigger || !scene.Layers[m.LayerIndex].Enabled || !_canvas.IsVisible(m.Position.X - 1f, m.Position.Z - 1f, m.Position.X + 1f, m.Position.Z + 1f))
             {
                 continue;
             }
-            var exit = m.Type == (int)LgbInstanceType.ExitRange;
-            if (!exit && _canvas.Zoom < 4f)
+            var eobj = m.Type == (int)LgbInstanceType.EventObject ? model.EventObjectByKey.GetValueOrDefault(m.InstanceKey, -1) : -1;
+            var pop = m.Type == (int)LgbInstanceType.PopRange ? popByMarker.GetValueOrDefault(i, -1) : -1;
+            var r = eobj >= 0 ? new ObjectRef(ObjectKind.EObj, eobj) : pop >= 0 ? new ObjectRef(ObjectKind.Pop, pop) : ObjectRef.None;
+            var hot = r.Valid && (r == _hoverObject || r == _selectedObject);
+            if (_canvas.Zoom < 4f && !hot)
             {
                 continue;
             }
             var chosen = session.LastEstimate.MarkerIndex == i;
-            var color = chosen ? Colors.PlayerInteresting : exit ? Colors.Other3 : UICanvas2D.WithAlpha(Colors.Other4, 0xA0);
-            var p = new WPos(m.Position.X, m.Position.Z);
-            _canvas.ScreenCircle(_canvas.ToScreen(p), exit ? 6f : 4f, color, 2f);
-            if (exit || _canvas.Zoom >= 8f)
+            var color = hot || chosen ? Colors.PlayerInteresting : m.Type switch
             {
-                _canvas.Text(p, exit ? $"exit {i}" : $"{m.TypeName} {i}{(m.Name.Length > 0 ? $" {m.Name}" : "")}", color, new(8f, -6f));
+                (int)LgbInstanceType.EventObject => UICanvas2D.WithAlpha(Colors.Other4, 0xC0),
+                (int)LgbInstanceType.PopRange => UICanvas2D.WithAlpha(Colors.Other3, 0xA0),
+                _ => UICanvas2D.WithAlpha(Colors.Other4, 0x80),
+            };
+            var p = new WPos(m.Position.X, m.Position.Z);
+            var sp = _canvas.ToScreen(p);
+            if (eobj >= 0)
+            {
+                var eo = model.EventObjects[eobj];
+                if (eo.Role is ZoneObjectRole.Entrance or ZoneObjectRole.Exit or ZoneObjectRole.Warp or ZoneObjectRole.Shortcut)
+                {
+                    // the run's waypoints are always labelled and drawn bigger
+                    hot = true;
+                    color = hot && (r == _hoverObject || r == _selectedObject) ? Colors.PlayerInteresting : eo.Role switch
+                    {
+                        ZoneObjectRole.Entrance => Colors.Safe,
+                        ZoneObjectRole.Exit => Colors.Danger,
+                        ZoneObjectRole.Warp => Colors.Other2,
+                        _ => Colors.Other3,
+                    };
+                    _canvas.ScreenCircle(sp, 7f, color, 2.5f);
+                }
+                if (eo.ControlsCollision)
+                {
+                    // controllers draw as squares; a hollow square when the collision they control is off in the scene
+                    var on = eo.BoundNode >= 0 && scene.IsNodeActive(eo.BoundNode);
+                    ImGui.GetWindowDrawList().AddRect(sp - new Vector2(5f, 5f), sp + new Vector2(5f, 5f), color, 0f, ImDrawFlags.None, on ? 2.5f : 1f);
+                }
+                else
+                {
+                    _canvas.ScreenCircle(sp, 4f, color, 2f);
+                }
             }
+            else if (pop >= 0)
+            {
+                _canvas.ScreenCircle(sp, 4f, color, 1.5f);
+                _canvas.Crosshair(p, 4f, color, 1f);
+            }
+            else
+            {
+                _canvas.ScreenCircle(sp, 4f, color, 2f);
+            }
+            if (hot || _canvas.Zoom >= 8f)
+            {
+                string label;
+                if (eobj >= 0)
+                {
+                    var eo = model.EventObjects[eobj];
+                    var st = session.EObjState(eobj);
+                    label = $"EObj {eo.Label}{(st is { } v ? $" [s={v}]" : "")}{(eo.Role != ZoneObjectRole.None ? $" {RoleName(eo.Role)}" : "")}";
+                }
+                else if (pop >= 0)
+                {
+                    label = $"pop {model.PopPoints[pop].PopType}";
+                }
+                else
+                {
+                    label = $"{m.TypeName} {i}{(m.Name.Length > 0 ? $" {m.Name}" : "")}";
+                }
+                _canvas.Text(p, label, color, new(8f, -6f));
+            }
+        }
+        // exits are drawn at every zoom, they anchor the last room
+        for (var i = 0; i < model.Exits.Count; ++i)
+        {
+            var e = model.Exits[i];
+            var r = new ObjectRef(ObjectKind.Exit, i);
+            var color = r == _hoverObject || r == _selectedObject ? Colors.PlayerInteresting : Colors.Other3;
+            var p = new WPos(e.Position.X, e.Position.Z);
+            _canvas.ScreenCircle(_canvas.ToScreen(p), 6f, color, 2f);
+            _canvas.Text(p, $"exit {e.ExitIndex}", color, new(8f, -6f));
         }
     }
 
@@ -422,14 +958,26 @@ public sealed partial class ZoneArenaEditorWindow
                 continue;
             }
             var active = session.ActiveSeals.Contains(seal.BoxIndex);
+            var inScene = scene.IsBoxEnabled(seal.BoxIndex);
             var chosen = i == session.LastEstimate.SealA || i == session.LastEstimate.SealB;
-            var color = i == _hoveredSeal ? Colors.PlayerInteresting : active ? Colors.Danger : UICanvas2D.WithAlpha(Colors.Danger, 0x60);
+            var color = i == _hoveredSeal ? Colors.PlayerInteresting : !inScene ? UICanvas2D.WithAlpha(Colors.Shadows, 0xA0) : active ? Colors.Danger : UICanvas2D.WithAlpha(Colors.Danger, 0x60);
             var fp = seal.FootprintXZ;
+            if (!inScene && !_ghostInactive && i != _hoveredSeal)
+            {
+                continue;
+            }
             for (var k = 0; k < fp.Count; ++k)
             {
                 var a = fp[k];
                 var b = fp[(k + 1) % fp.Count];
-                _canvas.Line(new WPos(a.X / scale, a.Y / scale), new WPos(b.X / scale, b.Y / scale), color, chosen ? 4f : 2f);
+                if (inScene)
+                {
+                    _canvas.Line(new WPos(a.X / scale, a.Y / scale), new WPos(b.X / scale, b.Y / scale), color, chosen ? 4f : 2f);
+                }
+                else
+                {
+                    DashedLine(new Vector3(a.X / scale, seal.Center.Y, a.Y / scale), new Vector3(b.X / scale, seal.Center.Y, b.Y / scale), color, 2f);
+                }
             }
             if (active)
             {
@@ -446,6 +994,44 @@ public sealed partial class ZoneArenaEditorWindow
                 }
             }
             _canvas.Text(new WPos(seal.Center.X, seal.Center.Z), $"seal {i}", color, new(6f, -6f));
+        }
+        // the pairs: seal to seal or seal to node, the chosen one solid and thick, the rest thin; a single seal's inward side as a short tick
+        for (var i = 0; i < session.Pairs.Count; ++i)
+        {
+            var p = session.Pairs[i];
+            var a = session.Seals[p.SealA].Center;
+            Vector3 b;
+            if (p.SealB >= 0)
+            {
+                b = session.Seals[p.SealB].Center;
+            }
+            else if (p.MarkerIndex >= 0)
+            {
+                b = p.HasTarget ? p.Target : scene.Markers[p.MarkerIndex].Position;
+            }
+            else
+            {
+                continue;
+            }
+            if (!_canvas.IsVisible(MathF.Min(a.X, b.X), MathF.Min(a.Z, b.Z), MathF.Max(a.X, b.X), MathF.Max(a.Z, b.Z)))
+            {
+                continue;
+            }
+            var chosen = i == session.PairIndex;
+            var manual = p.Kind.StartsWith("manual");
+            var col = UICanvas2D.WithAlpha(manual ? Colors.PlayerInteresting : Colors.Danger, chosen ? (byte)0xC0 : (byte)0x50);
+            if (chosen)
+            {
+                _canvas.Line(a, b, col, 2f);
+            }
+            else
+            {
+                DashedLine(a, b, col, 1f, 8f);
+            }
+            if (p.MarkerIndex >= 0)
+            {
+                _canvas.ScreenCircle(_canvas.ToScreen(b), 5f, col, 1.5f);
+            }
         }
     }
 
@@ -512,20 +1098,36 @@ public sealed partial class ZoneArenaEditorWindow
             var color = i == _hoverDeletedVertex ? Colors.PlayerInteresting : Colors.Danger;
             _canvas.ScreenCircle(s, i == _hoverDeletedVertex ? 7f : 4f, color, 1.5f);
         }
-        if (_hoverVertexPoly >= 0)
+        if (HoveredContour() is { } c && _hoverVertexIndex < c.SimplifiedDraw.Length)
         {
-            var c = _hoverVertexContour < 0 ? _pipeline.Preview[_hoverVertexPoly].Outer : _pipeline.Preview[_hoverVertexPoly].Holes[_hoverVertexContour];
             var pts = c.SimplifiedDraw;
-            if (_hoverVertexIndex < pts.Length)
-            {
-                var p = pts[_hoverVertexIndex];
-                _canvas.ScreenCircle(_canvas.ToScreen(p), 7f, Colors.PlayerInteresting, 2f);
-                var prev = pts[(_hoverVertexIndex + pts.Length - 1) % pts.Length];
-                var next = pts[(_hoverVertexIndex + 1) % pts.Length];
-                _canvas.Line(prev, next, UICanvas2D.WithAlpha(Colors.PlayerInteresting, 0xA0), 1.5f); // where the edge goes after deleting
-                _canvas.Text(new WPos(p.X, p.Z), $"({p.X:f3}, {p.Z:f3}) click deletes", Colors.PlayerInteresting, new(10f, -18f));
-            }
+            var p = pts[_hoverVertexIndex];
+            _canvas.ScreenCircle(_canvas.ToScreen(p), 7f, Colors.PlayerInteresting, 2f);
+            var prev = pts[(_hoverVertexIndex + pts.Length - 1) % pts.Length];
+            var next = pts[(_hoverVertexIndex + 1) % pts.Length];
+            _canvas.Line(prev, next, UICanvas2D.WithAlpha(Colors.PlayerInteresting, 0xA0), 1.5f); // where the edge goes after deleting
+            _canvas.Text(new WPos(p.X, p.Z), $"({p.X:f3}, {p.Z:f3}) click deletes", Colors.PlayerInteresting, new(10f, -18f));
         }
+        else
+        {
+            _hoverVertexPoly = _hoverVertexContour = _hoverVertexIndex = -1; // the preview shrank under last frame's hover
+        }
+    }
+
+    // the preview contour the vertex hover points at; null when there is none or a recompute shrank the preview since the hover was taken
+    private ArenaPolygonPipeline.PreviewContour? HoveredContour()
+    {
+        var preview = _pipeline.Preview;
+        if (_hoverVertexPoly < 0 || _hoverVertexPoly >= preview.Count)
+        {
+            return null;
+        }
+        var poly = preview[_hoverVertexPoly];
+        if (_hoverVertexContour < 0)
+        {
+            return poly.Outer;
+        }
+        return _hoverVertexContour < poly.Holes.Count ? poly.Holes[_hoverVertexContour] : null;
     }
 
     // nearest preview vertex / deleted vertex to the cursor within a screen radius
@@ -591,6 +1193,10 @@ public sealed partial class ZoneArenaEditorWindow
         {
             _canvas.Poly(CollectionsMarshal.AsSpan(_polygonDraft), Colors.Vulnerable, 2f, false);
             _canvas.Line(_polygonDraft[^1], _snapValid ? new WPos(_snapVertex.X, _snapVertex.Z) : _canvas.MouseWorld, UICanvas2D.WithAlpha(Colors.Vulnerable, 0x80), 1f);
+            if (_polygonDraft.Count >= 3)
+            {
+                _canvas.ScreenCircle(_canvas.ToScreen(_polygonDraft[0]), 8f, Colors.Vulnerable, 1.5f); // a click inside closes the draft
+            }
         }
     }
 
@@ -635,6 +1241,15 @@ public sealed partial class ZoneArenaEditorWindow
         }
         var lift = new Vector3(0f, _worldPreviewLift, 0f);
         var preview = _pipeline.Preview;
+        if (_worldPreviewMode == 1)
+        {
+            // the bounds the snippet builds, through the framework's own constructor (hitbox offsets and its simplification applied)
+            if (_pipeline.PreviewBounds() is { } bounds)
+            {
+                camera.DrawWorldPoly(new Vector3(bounds.Center.X, PreviewFloorY() + _worldPreviewLift, bounds.Center.Z), bounds.Shape, Colors.Border, 2f);
+            }
+            return;
+        }
         for (var i = 0; i < preview.Count; ++i)
         {
             DrawWorldContour(camera, preview[i].Outer, Colors.Safe, lift, i);
@@ -644,6 +1259,59 @@ public sealed partial class ZoneArenaEditorWindow
                 DrawWorldContour(camera, holes[h], Colors.Danger, lift, i);
             }
         }
+    }
+
+    // mean floor height of the enabled result contours (the bounds themselves carry no height unless the floor is flat)
+    private float PreviewFloorY()
+    {
+        var sum = 0f;
+        var n = 0;
+        var preview = _pipeline.Preview;
+        for (var i = 0; i < preview.Count; ++i)
+        {
+            if (preview[i].Outer.Enabled)
+            {
+                sum += preview[i].Outer.MeanY;
+                ++n;
+            }
+        }
+        return n > 0 ? sum / n : _session?.Centre.Y ?? 0f;
+    }
+
+    // the ArenaBoundsCustom preview on the canvas too, so the hitbox offset can be compared with the contours
+    private void DrawBoundsPreview()
+    {
+        if (!_showResult || _worldPreviewMode != 1 || _pipeline.PreviewBounds() is not { } bounds)
+        {
+            return;
+        }
+        var parts = bounds.Shape.Parts;
+        var color = Colors.Border;
+        for (var i = 0; i < parts.Count; ++i)
+        {
+            var part = parts[i];
+            DrawRelContour(part.Exterior, bounds.Center, color, 2f);
+            var holeCount = part.HoleStarts.Count;
+            for (var h = 0; h < holeCount; ++h)
+            {
+                DrawRelContour(part.Interior(h), bounds.Center, color, 1.5f);
+            }
+        }
+    }
+
+    private void DrawRelContour(ReadOnlySpan<WDir> contour, WPos center, uint color, float thickness)
+    {
+        var n = contour.Length;
+        if (n == 0)
+        {
+            return;
+        }
+        _relContour.Clear();
+        for (var i = 0; i < n; ++i)
+        {
+            _relContour.Add(center + contour[i]);
+        }
+        _canvas.Poly(CollectionsMarshal.AsSpan(_relContour), color, thickness);
     }
 
     private void DrawWorldContour(Camera camera, ArenaPolygonPipeline.PreviewContour c, uint color, Vector3 lift, int index)
@@ -714,6 +1382,8 @@ public sealed partial class ZoneArenaEditorWindow
             _snapValid = picker.NearestVertex(_canvas.MouseWorld, MathF.Max(0.5f, 8f / _canvas.Zoom), TriangleAllowed, out _snapVertex, out _);
         }
         UpdateHoverBox();
+        UpdateHoverObject();
+        HandleObjectClicks(spaceHeld);
 
         // any left click on the canvas latches the anchor triangle/vertex for the sidebar actions
         if (_canvas.Hovered && !spaceHeld && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
@@ -732,11 +1402,11 @@ public sealed partial class ZoneArenaEditorWindow
             {
                 if (ShiftHeld)
                 {
-                    ToggleFloorAnchorMesh();
+                    ToggleAnchorMeshMode(MeshMode.Include);
                 }
                 else
                 {
-                    ToggleExcludeAnchorMesh();
+                    ToggleAnchorMeshMode(MeshMode.Exclude);
                 }
                 return;
             }
@@ -758,9 +1428,7 @@ public sealed partial class ZoneArenaEditorWindow
                 {
                     p = new(MathF.Round(p.X * 2f) / 2f, MathF.Round(p.Z * 2f) / 2f);
                 }
-                var top = session.PickTriangle(new(p.X, p.Z), session.Centre.Y);
-                var y = top >= 0 ? scene.Triangles[top].YAt(p.X, p.Z) : session.Centre.Y;
-                session.SetCentre(new(p.X, y, p.Z));
+                session.SetCentre(new(p.X, FloorYAt(new(p.X, session.Centre.Y, p.Z)), p.Z));
             }
             else
             {
@@ -774,6 +1442,10 @@ public sealed partial class ZoneArenaEditorWindow
         switch (_tool)
         {
             case Tool.Pick:
+                if (_hoverObject.Valid && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                {
+                    break; // the click selected the object
+                }
                 if (_canvas.Hovered && !spaceHeld && _hoverTri < 0 && _hoverBox >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
                 {
                     ToggleHoveredBox(); // click on a box with no triangle under the cursor toggles it (floor: selected, obstacle: cut/ignored)
@@ -812,23 +1484,7 @@ public sealed partial class ZoneArenaEditorWindow
                     var max = new WPos(MathF.Max(_canvas.DragStart.X, _canvas.DragEnd.X), MathF.Max(_canvas.DragStart.Z, _canvas.DragEnd.Z));
                     _scratch.Clear();
                     picker.CentroidsInRect(min, max, TriangleAllowed, _scratch);
-                    if (!ctrl && _selectFloorOnly)
-                    {
-                        FilterFloorOnly(_scratch);
-                    }
-                    if (_selectLayerOnly && _layerRefValid)
-                    {
-                        FilterLayer(_scratch, _layerRefY);
-                    }
-                    var arr = _scratch.ToArray();
-                    if (ctrl)
-                    {
-                        _selection.Apply([], arr, "rect remove");
-                    }
-                    else
-                    {
-                        _selection.Apply(arr, [], "rect add");
-                    }
+                    ApplySelectionPick(ctrl, ctrl ? "rect remove" : "rect add");
                 }
                 break;
             case Tool.Brush:
@@ -848,23 +1504,7 @@ public sealed partial class ZoneArenaEditorWindow
                     {
                         _scratch.Clear();
                         picker.CentroidsInCircle(_canvas.MouseWorld, _brushRadius, TriangleAllowed, _scratch);
-                        if (!ctrl && _selectFloorOnly)
-                        {
-                            FilterFloorOnly(_scratch);
-                        }
-                        if (_selectLayerOnly && _layerRefValid)
-                        {
-                            FilterLayer(_scratch, _layerRefY);
-                        }
-                        var arr = _scratch.ToArray();
-                        if (ctrl)
-                        {
-                            _selection.Apply([], arr, "brush");
-                        }
-                        else
-                        {
-                            _selection.Apply(arr, [], "brush");
-                        }
+                        ApplySelectionPick(ctrl, "brush");
                     }
                     else
                     {
@@ -877,9 +1517,8 @@ public sealed partial class ZoneArenaEditorWindow
                 UpdateVertexHover();
                 if (_canvas.Hovered && !spaceHeld && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
                 {
-                    if (_hoverVertexPoly >= 0)
+                    if (HoveredContour() is { } c)
                     {
-                        var c = _hoverVertexContour < 0 ? _pipeline.Preview[_hoverVertexPoly].Outer : _pipeline.Preview[_hoverVertexPoly].Holes[_hoverVertexContour];
                         if (_hoverVertexIndex < c.Simplified.Length)
                         {
                             _pipeline.DeletedVertices.Add(c.Simplified[_hoverVertexIndex]);
@@ -917,6 +1556,28 @@ public sealed partial class ZoneArenaEditorWindow
                     FinishPolygonDraft();
                 }
                 break;
+        }
+    }
+
+    // the triangles a rect / brush picked into _scratch, filtered by the floor and layer options, added to or removed from the selection
+    private void ApplySelectionPick(bool ctrl, string label)
+    {
+        if (!ctrl && _selectFloorOnly)
+        {
+            FilterFloorOnly(_scratch);
+        }
+        if (_selectLayerOnly && _layerRefValid)
+        {
+            FilterLayer(_scratch, _layerRefY);
+        }
+        var picked = CollectionsMarshal.AsSpan(_scratch);
+        if (ctrl)
+        {
+            _selection.Apply([], picked, label);
+        }
+        else
+        {
+            _selection.Apply(picked, [], label);
         }
     }
 
@@ -993,6 +1654,18 @@ public sealed partial class ZoneArenaEditorWindow
 
     private void DrawHover()
     {
+        if (_hoverObject.Valid && _scene != null && _session != null && !ImGui.IsPopupOpen(ObjectPopupId))
+        {
+            var desc = ObjectDescription(_hoverObject);
+            if (_hoverTri >= 0)
+            {
+                ref readonly var ht = ref _scene.Triangles[_hoverTri];
+                _canvas.Triangle(ht.A, ht.B, ht.C, UICanvas2D.WithAlpha(Colors.PlayerInteresting, 0x80), 1f);
+                desc += $"\n\ntriangle {_hoverTri} under the cursor (material 0x{ht.Effective:X})";
+            }
+            ImGui.SetTooltip(desc);
+            return;
+        }
         if (_hoverTri < 0 || _scene == null)
         {
             if (_snapValid)
