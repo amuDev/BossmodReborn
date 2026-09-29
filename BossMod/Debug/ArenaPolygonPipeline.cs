@@ -345,15 +345,14 @@ public sealed class ArenaPolygonPipeline
 
     // the shaped tree as preview polygons; every outer carries the raw outer's vertices, a hole its raw hole's: by index when the shaping kept
     // the hole count, else the raw hole with the nearest centroid, none when the raw polygon had no holes
-    private struct PreviewCollector : ITreeVisitor
+    private readonly struct PreviewCollector : ITreeVisitor
     {
         private readonly ArenaPolygonPipeline _owner;
         private readonly YSampler _ySource;
         private readonly PolygonWithHoles _raw;
         private readonly SimplifySettings _s;
         private readonly Vector2[] _rawHoleCentroids;
-        private PreviewPolygon? _poly;
-        private bool _byIndex;
+        private readonly List<(PreviewPolygon poly, bool byIndex)> _open = []; // outers still taking holes, innermost last
 
         public PreviewCollector(ArenaPolygonPipeline owner, YSampler ySource, PolygonWithHoles raw, in SimplifySettings s)
         {
@@ -376,33 +375,38 @@ public sealed class ArenaPolygonPipeline
 
         public bool Outer(Path64 path, int holeCount)
         {
-            _poly = new();
-            _byIndex = holeCount == _raw.Holes.Count;
-            return _owner.FinishContour(_poly.Outer, path, _ySource, _raw.Outer, _s);
+            var poly = new PreviewPolygon();
+            if (!_owner.FinishContour(poly.Outer, path, _ySource, _raw.Outer, _s))
+            {
+                return false;
+            }
+            _open.Add((poly, holeCount == _raw.Holes.Count));
+            return true;
         }
 
         public void Hole(Path64 path, int index)
         {
+            var (poly, byIndex) = _open[^1];
             var hole = new PreviewContour();
-            if (_owner.FinishContour(hole, path, _ySource, RawHole(path, index), _s))
+            if (_owner.FinishContour(hole, path, _ySource, RawHole(path, index, byIndex), _s))
             {
-                _poly!.Holes.Add(hole);
+                poly.Holes.Add(hole);
             }
         }
 
         public void EndOuter()
         {
-            _owner.Preview.Add(_poly!);
-            _poly = null;
+            _owner.Preview.Add(_open[^1].poly);
+            _open.RemoveAt(_open.Count - 1);
         }
 
-        private readonly List<Vector3> RawHole(Path64 path, int index)
+        private List<Vector3> RawHole(Path64 path, int index, bool byIndex)
         {
             if (_rawHoleCentroids.Length == 0)
             {
                 return [];
             }
-            if (_byIndex)
+            if (byIndex)
             {
                 return _raw.Holes[index];
             }

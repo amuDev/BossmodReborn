@@ -2,7 +2,8 @@ using Clipper2Lib;
 
 namespace BossMod;
 
-// receives the polygons of a clipper tree walk: an outer, its direct holes, then EndOuter; islands inside holes come back as outers of their own
+// receives the polygons of a clipper tree walk: an outer, its direct holes, then EndOuter; islands inside holes come back as outers of their own,
+// nested between their parent's Outer and EndOuter (so an island ends before its parent)
 public interface ITreeVisitor
 {
     // false skips the outer and everything nested in it; holeCount = the direct holes the walk will report
@@ -217,9 +218,9 @@ public static class BoxFootprintOps
         }
     }
 
-    private struct PolygonCollector(List<PolygonWithHoles> dst, IHeightSource ySource, double minAreaScaled, long scale) : ITreeVisitor
+    private readonly struct PolygonCollector(List<PolygonWithHoles> dst, IHeightSource ySource, double minAreaScaled, long scale) : ITreeVisitor
     {
-        private PolygonWithHoles? _current;
+        private readonly List<PolygonWithHoles> _open = []; // outers still taking holes, innermost last
 
         public bool Outer(Path64 path, int holeCount)
         {
@@ -227,22 +228,22 @@ public static class BoxFootprintOps
             {
                 return false;
             }
-            _current = new() { Outer = PathToVectorsCCW(path, ySource, scale), Holes = [] };
+            _open.Add(new() { Outer = PathToVectorsCCW(path, ySource, scale), Holes = [] });
             return true;
         }
 
-        public readonly void Hole(Path64 path, int index)
+        public void Hole(Path64 path, int index)
         {
             if (path.Count >= 3 && Math.Abs(Clipper.Area(path)) >= minAreaScaled)
             {
-                _current!.Holes.Add(PathToVectorsCCW(path, ySource, scale));
+                _open[^1].Holes.Add(PathToVectorsCCW(path, ySource, scale));
             }
         }
 
         public void EndOuter()
         {
-            dst.Add(_current!);
-            _current = null;
+            dst.Add(_open[^1]);
+            _open.RemoveAt(_open.Count - 1);
         }
     }
 

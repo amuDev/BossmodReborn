@@ -574,7 +574,7 @@ public sealed class TriangleAdjacency
     private static void EdgeIntervalPairs(EdgeRec[] edges, float snap, float step, List<(int a, int b)> pairs, CancellationToken ct)
     {
         var cells = new XZHashGrid(EdgeCell);
-        HashSet<long> tested = []; // a pair is decided once, whichever cells the two edges share
+        HashSet<long> linked = []; // a pair links once, whichever cells or edges it shares; a failed test proves nothing, another edge pair may still step
         for (var e = 0; e < edges.Length; ++e)
         {
             if ((e & 4095) == 0)
@@ -599,10 +599,11 @@ public sealed class TriangleAdjacency
                     for (var k = 0; k < list.Count; ++k)
                     {
                         ref readonly var other = ref edges[list[k]];
-                        if (other.Tri == edge.Tri || !tested.Add(PairKey(other.Tri, edge.Tri)) || !CanStep(edge, other, snap, step))
+                        if (other.Tri == edge.Tri || linked.Contains(PairKey(other.Tri, edge.Tri)) || !CanStep(edge, other, snap, step))
                         {
                             continue;
                         }
+                        linked.Add(PairKey(other.Tri, edge.Tri));
                         pairs.Add((other.Tri, edge.Tri));
                     }
                     list.Add(e);
